@@ -1,0 +1,28 @@
+# build artifacts
+modules/permissive_restore/*.cmd
+modules/permissive_restore/.*.cmd
+modules/permissive_restore/*.o
+modules/permissive_restore/*.mod
+modules/permissive_restore/*.mod.c
+modules/permissive_restore/Module.symvers
+modules/permissive_restore/modules.order
+# exploit build artifacts
+exploit/.gl_build/
+*.elf
+w2host-x200-b57
+su_daemon_aarch64_pie
+# generic binary outputs
+*.ko
+# shipped in-tree prebuilt modules (GPL-2.0-only, tracked on purpose)
+!modules/permissive_restore/permissive_restore.ko
+!modules/kernelsu/kernelsu.ko
+*.so
+# local release-asset staging (download from GitHub Release)
+prebuilt/
+# python
+__pycache__/
+*.pyc
+# dev / backup / logs
+*.bak*
+*.log
+*.out.txt

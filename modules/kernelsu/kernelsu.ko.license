@@ -1,0 +1,14 @@
+SPDX-FileCopyrightText: 2026 tiann (KernelSU authors), see upstream KernelSU
+SPDX-License-Identifier: GPL-2.0-only
+Source: official KernelSU v3.2.5 release asset
+            android15-6.6_kernelsu.ko (SHA256 5933ECA4..., BuildID
+            b61aef7e3fae7d02afb759c7a4acdecdd07aea2e, GPL-2.0-only)
+            https://github.com/tiann/KernelSU/releases/download/v3.2.5/android15-6.6_kernelsu.ko
+            + device adaptation: .modinfo vermagic rewritten to the X200 b57
+            kernel value (modules/kernelsu/patch_vermagic.py reproduces this
+            exact SHA256; only the vermagic string changes, code/symbols/
+            sections and BuildID are untouched).
+Corresponding source: official KernelSU v3.2.5 kernel/ sources @
+            b0bc817b4e966aa6aa830834eaf6ef765d821d40 (https://github.com/tiann/KernelSU)
+SHA256 (adapted): 187BB1BD4732DD1E193C09E1BA35A5D3A2B35190B32AABF3F2F7B0CDB03A71FB
+vermagic: 6.6.89-android15-8-gb57af212129c-abogki457297774-4k

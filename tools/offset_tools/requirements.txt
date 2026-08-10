@@ -1,0 +1,4 @@
+# Python dependencies for the GhostLock-X200 host tools.
+# Install: pip install -r tools/offset_tools/requirements.txt
+capstone>=5.0
+pyelftools>=0.29

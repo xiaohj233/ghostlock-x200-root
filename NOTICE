@@ -1,0 +1,116 @@
+GhostLock-X200
+Copyright 2026 GhostLock-X200 contributors
+
+This product includes software developed as part of the GhostLock-X200
+project, an independent security-research implementation of temporary
+root for vivo X200 (PD2415 / MediaTek Dimensity 9400 / kernel
+6.6.89-android15-8-gb57af212129c).
+
+----------------------------------------------------------------------
+Third-party notices (code lineage and research references)
+----------------------------------------------------------------------
+
+1) The exploit sources under exploit/ include VERBATIM copies and
+   DERIVED works of the CVE-2026-43499 (GhostLock) exploit framework,
+   licensed under Apache-2.0 (see LICENSES/Apache-2.0.txt):
+
+   - NebuSec / CyberMeowfia (IonStack, CVE-2026-43499 writeup & PoC)
+     https://github.com/NebuSec/CyberMeowfia
+     commit 2c83bfb0c9230dc063e1bbfc3e06228d45dd938f
+     Licensed under the Apache License, Version 2.0.
+
+   Verbatim copies (marked "Unmodified copy ..." in file headers):
+     exploit/src/pipe.c, exploit/src/preload.c, exploit/src/root.c,
+     exploit/src/su_blob.S, exploit/src/wallpaper_blob.S,
+     exploit/assets/wallpaper.webp
+   Derived works (marked "Modified from ..." in file headers):
+     exploit/src/common.h, exploit/src/fops.c, exploit/src/main.c, exploit/src/slide.c,
+     exploit/src/util.c, exploit/src/su_daemon.c, exploit/src/target_x200.h,
+     exploit/src/standalone_main.c
+   Vendored components (also Apache-2.0, from the same upstream commit):
+     exploit/vendored/offset.h, exploit/vendored/kernelsnitch/ (futex_hash.h, kernelsnitch.h,
+     timeutils.h, utils.h; kernelsnitch.h is a local build variant,
+     modified from upstream - see git history / commit message)
+
+2) Additional adaptation references (Apache-2.0):
+   - boxiaolanya2008 / CVE-2026-43499-Neo11Plus
+     https://github.com/boxiaolanya2008/CVE-2026-43499-Neo11Plus
+     commit babd8dcad5b1f4537e81953e8b105f94b4e9440e
+   - YuKongA / ghostlock-app (W2 write-shape concept for slide.c;
+     perf-sampling leak idea for w2host.c)
+     https://github.com/YuKongA/ghostlock-app
+     commit b4fdb1f2f439004f9739371f52b69653fbfd8db1
+     exploit/src/w2host.c (LOCAL) uses the perf-sampling leak idea from
+     ghostlock-app and p2p3p/GhostLock-for-OnePlus (Apache-2.0) with an
+     independent implementation (IP window + x9==init_user_ns cross-check,
+     3-round intersect/majority); see the w2host.c file header.
+
+3) Architecture inspiration (no code included):
+   - p2p3p / GhostLock-for-OnePlus
+     https://github.com/p2p3p/GhostLock-for-OnePlus
+     commit 1250899efd3ebf5ac30399afa14e9c7f7171ec5f
+     (No LICENSE provided by upstream; authorized security research /
+     educational use only per its README.)
+
+4) Research references (no code included):
+
+   - tiann/KernelSU v3.2.5 (commit b0bc817b4e966aa6aa830834eaf6ef765d821d40)
+     userspace ksud = GPL-3.0-or-later; kernel/ component = GPL-2.0-only.
+   - ReSukiSU/ReSukiSU, SukiSU-Ultra/SukiSU-Ultra (GPL-3.0)
+   - JerryTse-OSS/VIVO-OTA-Tracker (see upstream license)
+   - hexo141/Rootme (see upstream license)
+   - NeoRoot (idea and preload.so from the Coolapk community)
+   - Other research references (see THIRD_PARTY_NOTICES.md; license
+     status UNKNOWN where not verified; such entries are marked TODO
+     and do not affect code distribution).
+
+5) Removed-from-distribution notes:
+
+   - tools/payload_dumper.py was removed: it is a third-party tool
+     (vm03/payload_dumper) without a redistribution license. Boot-image
+     payload extraction is documented as an external workflow using a
+     separately installed, appropriately licensed tool.
+   - The former prebuilt/android15-6.6_kernelsu.ko was removed: its
+     binary-to-source chain could not be verified and it is not an
+     unmodified official KernelSU artifact (official asset digest
+     differs). The chain was later fully recovered from the development
+     log: official v3.2.5 release asset + vermagic rewrite (reproduced
+     by modules/kernelsu/patch_vermagic.py). It is now shipped in-tree
+     as modules/kernelsu/kernelsu.ko (see 8 below).
+
+6) KernelSU userspace component (Release asset only, NOT in the Git tree):
+
+   - prebuilt/ksud = GPL-3.0-or-later, unmodified libksud.so extracted
+     from the official KernelSU v3.2.5 release APK
+     (KernelSU_v3.2.5_32525-release.apk); SHA256
+     077797B6CD07621B4352A55BBCFB03CB86A33F0FB044AEB4706445A21215EB57.
+     Distributed with the GPL-3.0 text and the upstream source link
+     (userspace/ksud @ v3.2.5).
+
+7) modules/permissive_restore/ (original code) is licensed GPL-2.0-only
+   (see LICENSES/GPL-2.0-only.txt). The source permissive_restore.c and the
+   shipped prebuilt permissive_restore.ko are both open source under
+   GPL-2.0-only. MODULE_LICENSE("GPL") is the matching loader declaration.
+
+8) modules/kernelsu/ (KernelSU kernel module, shipped in-tree):
+
+   - modules/kernelsu/kernelsu.ko = official KernelSU v3.2.5 release
+     asset (android15-6.6_kernelsu.ko, downloaded from the official
+     GitHub release; SHA256 5933ECA4EC82DACFF4209745DD7228CF95352AEF7423BA7434F8542BC848AA8C,
+     BuildID b61aef7e3fae7d02afb759c7a4acdecdd07aea2e; GPL-2.0-only) with a
+     device adaptation: the .modinfo vermagic string is rewritten to the
+     X200 b57 kernel value (6.6.89-android15-8-gb57af212129c-abogki457297774-4k)
+     so the module passes the loader check on this device. Only the vermagic
+     string changes; code, symbols, section layout and the BuildID are
+     untouched. Reproduction: modules/kernelsu/patch_vermagic.py (input
+     5933ECA4 -> output SHA256
+     187BB1BD4732DD1E193C09E1BA35A5D3A2B35190B32AABF3F2F7B0CDB03A71FB,
+     verified). Build record: 2026-08-09 development log (session
+     019fcfc8-53d7-7e90-8301-1b8f314179b9); device INSMOD verified.
+   - Corresponding source: official KernelSU v3.2.5 kernel/ sources
+     @ b0bc817b4e966aa6aa830834eaf6ef765d821d40
+     (https://github.com/tiann/KernelSU, GPL-2.0-only).
+
+----------------------------------------------------------------------
+This product is for authorized security research and educational
+purposes only. The authors assume no liability for any misuse.

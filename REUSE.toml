@@ -1,0 +1,43 @@
+version = 1
+SPDX-PackageName = "GhostLock-X200"
+
+[[annotations]]
+path = "**/*"
+SPDX-FileCopyrightText = "2026 GhostLock-X200 contributors"
+SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
+path = ["modules/permissive_restore/**"]
+SPDX-FileCopyrightText = "2026 GhostLock-X200 contributors"
+SPDX-License-Identifier = "GPL-2.0-only"
+
+[[annotations]]
+path = [
+  "exploit/src/pipe.c",
+  "exploit/src/preload.c",
+  "exploit/src/root.c",
+  "exploit/src/su_blob.S",
+  "exploit/src/wallpaper_blob.S",
+  "exploit/assets/wallpaper.webp",
+  "exploit/vendored/offset.h",
+  "exploit/vendored/kernelsnitch/futex_hash.h",
+  "exploit/vendored/kernelsnitch/timeutils.h",
+  "exploit/vendored/kernelsnitch/utils.h",
+]
+SPDX-FileCopyrightText = "NebuSec (see NOTICE)"
+SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
+path = [
+  "exploit/src/common.h",
+  "exploit/src/fops.c",
+  "exploit/src/main.c",
+  "exploit/src/slide.c",
+  "exploit/src/util.c",
+  "exploit/src/su_daemon.c",
+  "exploit/src/target_x200.h",
+  "exploit/src/standalone_main.c",
+  "exploit/vendored/kernelsnitch/kernelsnitch.h",
+]
+SPDX-FileCopyrightText = "2026 GhostLock-X200 contributors; NebuSec (see NOTICE)"
+SPDX-License-Identifier = "Apache-2.0"

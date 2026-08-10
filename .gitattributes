@@ -1,0 +1,17 @@
+# Normalize line endings for cross-platform correctness.
+# .sh/.py/Makefile must stay LF (WSL/Linux execution); .ps1 works with both.
+* text=auto
+*.sh text eol=lf
+*.py text eol=lf
+Makefile text eol=lf
+*.S text eol=lf
+*.c text eol=lf
+*.h text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.toml text eol=lf
+*.txt text eol=lf
+LICENSE text eol=lf
+NOTICE text eol=lf
+.gitignore text eol=lf
+*.ps1 text eol=crlf
