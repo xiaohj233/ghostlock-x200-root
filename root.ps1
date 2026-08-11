@@ -23,6 +23,8 @@
 # 自动依赖下载 (开箱即用, 写入 %LOCALAPPDATA%\GhostLock-X200\deps, 不进仓库):
 #   adb (platform-tools 官方) / Python 依赖 (pip) / payload-dumper-go (GitHub release)
 #   / vmlinux-to-elf (pip, GPL-3.0) — 均在缺失且联网时自动获取; -SkipDeps 关闭.
+# 异常重启诊断 (默认开启): 主链失败后自动采集诊断日志 (检测到重启则含 pstore/AEE 等
+#   panic 产物), 打包 ghostlock_diag_<时间戳>.zip 并给出指引; -NoPanicDiag 关闭.
 # ============================================================
 param(
   [switch]$Force,          # 跳过 build 检测, 强制用随包 b57 偏移直接跑
@@ -36,11 +38,25 @@ param(
   [string]$DepsDir,        # 依赖下载目录 (默认 %LOCALAPPDATA%\GhostLock-X200\deps; 可指定项目根目录打包)
   [switch]$DepsInPackage,  # 依赖下载到项目根目录 (等价 -DepsDir <包根>; 发布离线包用)
   [switch]$NoLog,          # 不写日志 (默认每次自动写 %TEMP%\ghostlock_root_<时间戳>.log)
-  [string]$LogPath         # 日志文件路径 (默认 %TEMP%\ghostlock_root_<时间戳>.log)
+  [string]$LogPath,        # 日志文件路径 (默认 %TEMP%\ghostlock_root_<时间戳>.log)
+  [switch]$NoPanicDiag     # 主链失败后不自动采集 panic 诊断日志 (默认开启)
 )
 $ErrorActionPreference = 'SilentlyContinue'
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $pkgRoot   = $scriptDir
+# 智能 adb 定位 (共用工具: 显式 > 环境 > PATH > 常见位置 > 有界搜索, 均校验可用性)
+if (Test-Path (Join-Path $pkgRoot "tools\scripts\find_adb.ps1")) {
+  . (Join-Path $pkgRoot "tools\scripts\find_adb.ps1")
+} else {
+  # 容错: 包内缺 find_adb.ps1 时退化为旧逻辑 (不因缺文件直接报错)
+  function Test-AdbWorking { param([string]$Path) return [bool]$Path }
+  function Get-AdbPath {
+    param([string]$Preferred)
+    if ($Preferred) { return $Preferred }
+    if ($env:ANDROID_ADB) { return $env:ANDROID_ADB }
+    return (Get-Command adb -ErrorAction SilentlyContinue).Source
+  }
+}
 $EXPECTED_KERNEL = "b57af212129c"
 $KERNEL_ELF_PAT  = $null   # 本次生成/找到的 kernel ELF
 $GEN_WIN_OFFS    = $null   # 本次生成的 win_offs json
@@ -193,21 +209,9 @@ function Find-VmlinuxToElf {
 }
 
 function Find-Adb {
-  if ($AdbPath) { return $AdbPath }
-  if ($env:ANDROID_ADB) { return $env:ANDROID_ADB }
-  $a = (Get-Command adb -ErrorAction SilentlyContinue).Source
-  if ($a) { return $a }
-  foreach ($cand in @(
-      "C:\Program Files\platform-tools\adb.exe",
-      "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe",
-      "$env:USERPROFILE\scoop\apps\platform-tools\current\adb.exe",
-      "C:\ProgramData\chocolatey\bin\adb.exe",
-      "C:\platform-tools\adb.exe",
-      (Join-Path $env:LOCALAPPDATA "GhostLock-X200\deps\platform-tools\adb.exe"),
-      (Join-Path (Get-DepsDir) "platform-tools\adb.exe"))) {
-    if (Test-Path $cand) { return $cand }
-  }
-  return $null
+  return (Get-AdbPath -Preferred $AdbPath -PackageRoot $pkgRoot -ExtraCandidates @(
+    (Join-Path $env:LOCALAPPDATA "GhostLock-X200\deps\platform-tools\adb.exe"),
+    (Join-Path (Get-DepsDir) "platform-tools\adb.exe")))
 }
 
 # ---------- 依赖自动下载 (开箱即用; -SkipDeps 关闭) ----------
@@ -263,9 +267,12 @@ function Ensure-Adb {
   }
   $adbExe = Join-Path $dep "platform-tools\adb.exe"
   if (Test-Path $adbExe) {
-    $env:ANDROID_ADB = $adbExe
-    SayOk "adb 已自动安装: $adbExe"
-    return $adbExe
+    if (Test-AdbWorking $adbExe) {
+      $env:ANDROID_ADB = $adbExe
+      SayOk "adb 已自动安装: $adbExe"
+      return $adbExe
+    }
+    SayErr "下载的 adb.exe 校验失败 (残缺文件?), 请手动安装 platform-tools 或重试"; return $null
   }
   SayErr "platform-tools 解压后未找到 adb.exe: $dep"; return $null
 }
@@ -516,15 +523,276 @@ function Build-WinOffsFromAsset {
 }
 
 # ============================================================
+# 异常重启诊断: 自动采集 -> manifest -> zip -> 指引
+# 输出内容面向 AI/维护者: UTF-8 纯文本, 每个文件带文件头注释,
+# 附带 00_manifest.json (机器可读索引) 与 99_READ_ME.txt (阅读指南).
+# 只采集低噪音高价值项, 不抓全量 logcat/getprop/系统日志目录.
+# 安全约束 (保证采集本身不会引发 panic):
+#   - 全部为只读 adb 命令, 不写设备关键区 (仅读 /data/local/tmp 等普通文件);
+#   - 流式节点 (/dev/kmsg /proc/kmsg) 一律不使用, 内核日志走 dmesg 快照;
+#   - 采集只在主链进程退出后执行, 不与任何写操作并发;
+#   - 设备掉线时命令立即失败返回空, 不等待、不重试、不阻塞.
+# ============================================================
+function AdbSh([string]$Cmd) {
+  if (-not $adb -or -not $serial) { return "" }
+  try { return ((& $adb -s $serial shell $Cmd 2>$null | Out-String) -replace "`r?`n$", "").Trim() } catch { return "" }
+}
+
+function Get-DeviceOnline {
+  $m = @(& $adb devices 2>$null | Select-String "`tdevice$")
+  return ($m.Count -gt 0)
+}
+
+function Wait-DeviceOnline {
+  param([int]$Minutes = 12)
+  for ($i = 0; $i -lt ($Minutes * 60 / 10); $i++) {
+    if (Get-DeviceOnline) { return $true }
+    Start-Sleep -Seconds 10
+  }
+  return $false
+}
+
+function Get-BootIdNow { return (AdbSh "cat /proc/sys/kernel/random/boot_id 2>/dev/null") }
+
+function Get-BootReasonNow {
+  $a = AdbSh "getprop ro.boot.bootreason"
+  $b = AdbSh "getprop sys.boot.reason"
+  $s = ($a + " | " + $b).Trim()
+  return $s.Trim(" |")
+}
+
+function Get-BuildHash([string]$Ver) {
+  if ($Ver -match 'g([0-9a-f]{12})') { return $matches[1] }
+  return ""
+}
+
+# 统一文件头: 每个采集文件首 4 行说明用途, 便于 AI 解析
+function Write-DiagFile {
+  param([string]$Path, [string]$Title, [string]$Content, [string]$Note = "")
+  $header = @(
+    "# ============================================================",
+    "# file:   " + (Split-Path $Path -Leaf),
+    "# 内容:   " + $Title,
+    "# 采集时间: " + (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+  )
+  if ($Note) { $header += ("# 备注:   " + $Note) }
+  $header += ("# ============================================================")
+  if ([string]::IsNullOrEmpty($Content)) { $Content = "(空 / 无内容)" }
+  (@($header) + @($Content)) | Out-File -FilePath $Path -Encoding utf8
+}
+
+function New-DiagEntry {
+  param([string]$OutDir, [string]$Name, [string]$Note)
+  $p = Join-Path $OutDir $Name
+  $sz = 0
+  if (Test-Path -LiteralPath $p -PathType Container) {
+    $sz = (Get-ChildItem -LiteralPath $p -Recurse -File | Measure-Object -Property Length -Sum).Sum
+  } elseif (Test-Path -LiteralPath $p) {
+    $sz = (Get-Item -LiteralPath $p).Length
+  }
+  if ($null -eq $sz) { $sz = 0 }   # 空目录时 Measure-Object Sum 为 $null, 归一为 0
+  return @{ name = $Name; size = $sz; note = $Note }
+}
+
+function Collect-PanicDiag {
+  param([string]$OutDir, [string]$Mode = "failure")   # Mode: panic=异常重启后采集 / failure=未重启现场采集
+  New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+  $now = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+  $files = @()
+
+  # ---- 01_boot_info.txt: 白名单属性 (不抓全量 getprop, 避免噪音) ----
+  $lines = @()
+  foreach ($p in @("ro.boot.bootreason", "sys.boot.reason", "ro.boot.hardware",
+      "ro.product.brand", "ro.product.model", "ro.build.version.release",
+      "ro.build.version.sdk", "ro.build.display.id")) {
+    $lines += ($p + "=" + (AdbSh ("getprop " + $p)))
+  }
+  $kv = AdbSh "cat /proc/version 2>/dev/null | head -1"
+  $lines += ("kernel.version=" + $kv)
+  $lines += ("kernel.build_hash=" + (Get-BuildHash $kv))
+  $lines += ("uptime.sec=" + (AdbSh "cat /proc/uptime 2>/dev/null"))
+  $lines += ("boot_id=" + (Get-BootIdNow))
+  $lines += ("lsmod=" + (AdbSh "cat /proc/modules 2>/dev/null | head -20"))
+  $f = Join-Path $OutDir "01_boot_info.txt"
+  Write-DiagFile $f "机型/内核/启动原因等关键属性 (白名单)" ($lines -join "`n")
+  $files += New-DiagEntry $OutDir "01_boot_info.txt" "机型/内核/启动原因关键属性, 分析起点"
+
+  # ---- 02_pstore: panic 瞬间内核日志 (ramoops, 最高价值) ----
+  $psDir = Join-Path $OutDir "02_pstore"
+  New-Item -ItemType Directory -Force -Path $psDir | Out-Null
+  (AdbSh "ls -la /sys/fs/pstore/ 2>&1") | Out-File (Join-Path $psDir "listing.txt") -Encoding utf8
+  $psNames = @((AdbSh "ls /sys/fs/pstore/ 2>/dev/null") -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+  foreach ($n in $psNames) {
+    $safe = ($n -replace '[^\w\.\-]', '_')
+    $content = AdbSh ("cat /sys/fs/pstore/" + $n + " 2>&1")
+    Write-DiagFile (Join-Path $psDir $safe) ("pstore: " + $n) $content
+  }
+  $files += New-DiagEntry $OutDir "02_pstore" "panic 瞬间内核日志 (dmesg-ramoops-*/console-ramoops-*); listing.txt 记录可读性"
+
+  # ---- 03_last_kmsg / 04_dmesg: 重启后尽力而为 (受限时注明原因, 不留空噪音) ----
+  $lk = AdbSh "cat /proc/last_kmsg 2>&1"
+  $f = Join-Path $OutDir "03_last_kmsg.txt"
+  Write-DiagFile $f "last_kmsg (旧内核遗留, 现代内核通常为空)" $lk "存在则为 panic 前内核日志"
+  $files += New-DiagEntry $OutDir "03_last_kmsg.txt" "last_kmsg 尝试"
+  $dm = AdbSh "dmesg 2>&1"
+  $f = Join-Path $OutDir "04_dmesg.txt"
+  if ([string]::IsNullOrEmpty($dm)) {
+    Write-DiagFile $f "重启后 dmesg 尝试" "" "dmesg 受限 (dmesg_restrict=1, 重启后无 root), 内核日志请以 02_pstore 为准"
+  } else {
+    Write-DiagFile $f "重启后 dmesg" $dm "若与 02_pstore 同时存在, 以 pstore 为 panic 主证据"
+  }
+  $files += New-DiagEntry $OutDir "04_dmesg.txt" "重启后 dmesg 尝试"
+
+  # ---- 05_mtk_aee: MTK 异常库目录清单 (仅清单, 不拉全树避免噪音) ----
+  $aeeDir = Join-Path $OutDir "05_mtk_aee"
+  New-Item -ItemType Directory -Force -Path $aeeDir | Out-Null
+  foreach ($p in @("/data/aee_exp", "/data/vendor/log/aee_exp",
+      "/sdcard/mtklog", "/data/vendor/log/mtklog", "/data/vendor/log")) {
+    $fn = ($p -replace '[^\w\.\-]', '_')
+    $ls = AdbSh ("ls -la " + $p + " 2>&1")
+    if (-not [string]::IsNullOrEmpty($ls)) {
+      Write-DiagFile (Join-Path $aeeDir ($fn + ".txt")) ("AEE/日志目录清单: " + $p) $ls
+    }
+  }
+  $files += New-DiagEntry $OutDir "05_mtk_aee" "MTK AEE/mtklog 目录清单 (权限允许时可进一步拉取)"
+
+  # ---- 06_local_tmp: panic 前最后动作 (运行标记/glt/w2 日志, 限量防噪音) ----
+  $tmpDir = Join-Path $OutDir "06_local_tmp"
+  New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
+  $tmpNames = @((AdbSh "ls /data/local/tmp/ 2>/dev/null") -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+  foreach ($n in $tmpNames) {
+    if ($n -match '^(glt_seq_|w2h_|w2dbg_|w2cred_|rootproof_|dmesg_pre_|run\.sh$|w\.log$|rootcmd_|diag_root_)') {
+      $safe = ($n -replace '[^\w\.\-]', '_')
+      if ($n -match '^diag_root_') {
+        # root 级日志快照目录 (STAGE6 有权限时 dump): 逐文件读取
+        $sub = @((AdbSh ("ls /data/local/tmp/" + $n + "/ 2>/dev/null")) -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        foreach ($sn in $sub) {
+          $content = AdbSh ("cat /data/local/tmp/" + $n + "/" + $sn + " 2>&1")
+          Write-DiagFile (Join-Path $tmpDir ($safe + "_" + $sn)) ("root 级日志: " + $sn) $content "STAGE6 root 权限阶段 dump (dmesg/kernel logcat/模块/selinux)"
+        }
+      } else {
+        $cmd = if ($n -match '\.(log|txt)$') { ("tail -n 2000 /data/local/tmp/" + $n + " 2>&1") } else { ("cat /data/local/tmp/" + $n + " 2>&1") }
+        $content = AdbSh $cmd
+        Write-DiagFile (Join-Path $tmpDir $safe) ("设备侧运行残留: " + $n) $content "glt_seq_* 的最后一条记录 = panic 前最后动作; *.log 仅保留末尾 2000 行"
+      }
+    }
+  }
+  $files += New-DiagEntry $OutDir "06_local_tmp" "panic 前最后动作标记 / glt/w2host 日志 / root 级快照 (限量)"
+
+  # ---- 07/08 logcat: 只抓 crash 缓冲 + main 尾部 300 行 ----
+  $f = Join-Path $OutDir "07_logcat_crash.txt"
+  Write-DiagFile $f "重启后 logcat crash 缓冲" (AdbSh "logcat -b crash -d -v threadtime 2>&1") "重启后缓冲已清空, 通常为空"
+  $files += New-DiagEntry $OutDir "07_logcat_crash.txt" "logcat crash 缓冲"
+  $f = Join-Path $OutDir "08_logcat_main_tail300.txt"
+  Write-DiagFile $f "重启后 logcat main 尾部 300 行" (AdbSh "logcat -b main -d -t 300 -v threadtime 2>&1") "仅尾部, 观察启动崩溃/关键错误"
+  $files += New-DiagEntry $OutDir "08_logcat_main_tail300.txt" "logcat main 尾部 300 行"
+
+  # ---- 99_READ_ME.txt: 给 AI/维护者的阅读指南 ----
+  $guide = @(
+    "本 zip 由 GhostLock-X200 root.ps1 自动采集 (mode=${Mode}: panic=异常重启后 / failure=未重启现场)。",
+    "所有 .txt 文件均为 UTF-8 纯文本, 前 4 行为文件头注释 (file/内容/采集时间/备注)。",
+    "采集为只读命令且仅在主链退出后执行, 不会引发 panic。",
+    "",
+    "推荐分析顺序:",
+    "  1) 00_manifest.json  -> 机器可读索引 (设备/内核/启动原因/文件清单+用途)",
+    "  2) 01_boot_info.txt  -> 确认机型/系统/内核构建与启动原因; kernel.build_hash 与工具预期不一致 = 机型不兼容高概率",
+    "  3) 02_pstore/*       -> panic 瞬间内核日志 (最关键): 在 dmesg-ramoops-0/console-ramoops-0 尾部查找",
+    "                          'Kernel panic - not syncing' / 'Call trace:' / 'CPU: <n> PID:' 定位崩溃栈与触发点",
+    "  4) 06_local_tmp/glt_seq_*.txt -> 最后一条 'WRITE cand=... gl5=...' 记录 = panic 前最后一次写操作",
+    "  5) 06_local_tmp/*.log -> glt/w2host 运行输出; 06_local_tmp/diag_root_* 为 STAGE6 root 阶段快照",
+    "  6) 98_main_chain.log / 97_root_console.log -> host 侧完整运行记录, 定位失败/panic 发生阶段",
+    "  7) 05_mtk_aee/*      -> MTK AEE 异常库清单 (如需完整 db 需 root 另抓)",
+    "",
+    "判读线索:",
+    "  - 02_pstore 有 dmesg-ramoops-0 且含 panic 栈      -> 内核 panic, 触发点见 06_local_tmp/glt_seq_*",
+    "  - bootreason 含 'watchdog'/'wdt'                 -> 看门狗复位 (卡死/软锁), 同样看 glt_seq_*",
+    "  - 01_boot_info kernel.build_hash != 预期 b57af212129c -> 内核不匹配, 极可能机型/系统版本不兼容",
+    "  - 06_local_tmp 缺失 glt_seq_*                    -> panic 发生在更早阶段, 结合 98_main_chain.log 定位",
+    "",
+    "非支持机型说明: 本工具官方仅支持预期内核构建的机型; 其他机型仅可用于排查, root 需二次开发适配。"
+  )
+  $f = Join-Path $OutDir "99_READ_ME.txt"
+  $guide | Out-File -FilePath $f -Encoding utf8
+  $files += New-DiagEntry $OutDir "99_READ_ME.txt" "阅读指南 (分析顺序与判读线索)"
+
+  # ---- 00_manifest.json / 00_manifest.txt: 机器可读索引 ----
+  $reason = Get-BootReasonNow
+  $panicLikely = if ($reason -match 'panic|wdt|watchdog') { "内核 panic 或看门狗复位 (需结合 02_pstore 确认)" } else { "异常重启, 原因待确认" }
+  $manifest = [ordered]@{
+    tool          = "GhostLock-X200 root.ps1"
+    version       = "v1.1.0"
+    collect_time  = $now
+    mode          = $Mode
+    device        = [ordered]@{
+      brand                = (AdbSh "getprop ro.product.brand")
+      model                = (AdbSh "getprop ro.product.model")
+      build                = (AdbSh "getprop ro.build.display.id")
+      sdk                  = (AdbSh "getprop ro.build.version.sdk")
+      kernel_version       = $kv
+      kernel_build_hash    = (Get-BuildHash $kv)
+      expected_kernel_build = "b57af212129c"
+    }
+    boot          = [ordered]@{
+      reason_raw   = $reason
+      panic_likely = $panicLikely
+      boot_id      = (Get-BootIdNow)
+    }
+    files         = $files
+  }
+  $manifest | ConvertTo-Json -Depth 6 | Out-File -FilePath (Join-Path $OutDir "00_manifest.json") -Encoding utf8
+  $mtxt = @()
+  $mtxt += ("tool=" + $manifest.tool + " version=" + $manifest.version + " mode=" + $manifest.mode + " collect_time=" + $manifest.collect_time)
+  $mtxt += ("device.brand=" + $manifest.device.brand)
+  $mtxt += ("device.model=" + $manifest.device.model)
+  $mtxt += ("device.build=" + $manifest.device.build)
+  $mtxt += ("device.sdk=" + $manifest.device.sdk)
+  $mtxt += ("device.kernel_version=" + $manifest.device.kernel_version)
+  $mtxt += ("device.kernel_build_hash=" + $manifest.device.kernel_build_hash + " expected=" + $manifest.device.expected_kernel_build)
+  $mtxt += ("boot.reason_raw=" + $manifest.boot.reason_raw)
+  $mtxt += ("boot.panic_likely=" + $manifest.boot.panic_likely)
+  $mtxt += ("boot.boot_id=" + $manifest.boot.boot_id)
+  $mtxt += ("files: " + (($manifest.files | ForEach-Object { $_.name + "(" + $_.size + "B:" + $_.note + ")" }) -join "; "))
+  $mtxt | Out-File -FilePath (Join-Path $OutDir "00_manifest.txt") -Encoding utf8
+  $files += New-DiagEntry $OutDir "00_manifest.json" "机器可读索引 (JSON)"
+  $files += New-DiagEntry $OutDir "00_manifest.txt" "索引 (人可读)"
+
+  return $manifest
+}
+
+function Show-PanicGuide {
+  param([string]$ZipPath, $Manifest, [string]$Mode = "failure")
+  if ($Mode -eq "panic") { SayErr "检测到设备异常重启 (内核 panic 或 watchdog 重启)。" }
+  elseif ($Mode -eq "offline") { SayErr "主链执行失败且设备长时间未恢复 (可能关机/未开启调试)。已保存 host 侧日志。" }
+  else { SayErr "主链执行失败 (设备未重启), 已采集现场诊断日志。" }
+  Say "==================== 诊断摘要 (可直接粘贴给 Agent) ===================="
+  Say ("tool=" + $Manifest.tool + " version=" + $Manifest.version + " mode=" + $Mode + " collect_time=" + $Manifest.collect_time)
+  Say ("device.brand=" + $Manifest.device.brand + " model=" + $Manifest.device.model)
+  Say ("device.build=" + $Manifest.device.build + " sdk=" + $Manifest.device.sdk)
+  Say ("device.kernel_version=" + $Manifest.device.kernel_version)
+  Say ("device.kernel_build_hash=" + $Manifest.device.kernel_build_hash + " expected=" + $Manifest.device.expected_kernel_build)
+  Say ("boot.reason_raw=" + $Manifest.boot.reason_raw)
+  Say ("boot.panic_likely=" + $Manifest.boot.panic_likely)
+  Say ("diag_zip=" + $ZipPath)
+  Say "========================================================================"
+  if ($Manifest.device.kernel_build_hash -and $Manifest.device.kernel_build_hash -ne $Manifest.device.expected_kernel_build) {
+    SayErr "当前内核构建与工具预期不一致, 极可能机型/系统版本不兼容导致 panic; 此工具官方仅支持预期内核构建的机型。"
+  }
+  SayOk "诊断日志已就绪: $ZipPath"
+  Say "请将该 zip 文件 (连同上方诊断摘要) 发送给维护者/Agent 分析。"
+  Say "分析提示: 01_boot_info.txt 看机型/内核; 02_pstore/ 尾部看 panic 调用栈; 06_local_tmp/glt_seq_*.txt 最后一条记录定位 panic 前动作。"
+}
+
+# ============================================================
 # MAIN
 # ============================================================
 Say "=============================================="
-Say " GhostLock-X200 一键 Root (v1.0)"
+Say " GhostLock-X200 一键 Root (v1.1.0)"
 Say "=============================================="
 
 # 0. 依赖自检 (adb + python 依赖; -SkipDeps 跳过自动下载)
 $adb = Ensure-Adb
 if (-not $adb) { exit 1 }
+$env:ANDROID_ADB = $adb   # 透传给主链子进程 (主链优先用此路径)
 $python = Ensure-PythonDeps
 if (-not $python) { exit 1 }
 SayOk "adb: $adb"
@@ -562,6 +830,9 @@ if ($Force) {
   SayOk "将使用新偏移: $GEN_WIN_OFFS"
 }
 
+# 记录运行前 boot_id, 用于主链失败后判断设备是否异常重启
+$bootIdBefore = (Get-BootIdNow)
+
 # 4. 调用主链
 $main = Join-Path $pkgRoot "tools\scripts\root_full_permissive_restore.ps1"
 $argsMain = @("-File", $main)
@@ -575,5 +846,68 @@ Say "=============================================="
 Say "调用主链: $main"
 Say "参数: $($argsMain -join ' ')"
 Say "=============================================="
-& powershell -NoProfile -ExecutionPolicy Bypass $argsMain
-exit $LASTEXITCODE
+# Tee 同时输出到控制台并完整捕获主链输出 (各阶段/报错, 判断失败发生在哪一阶段)
+$mainOutTee = $null
+& powershell -NoProfile -ExecutionPolicy Bypass $argsMain 2>&1 | Tee-Object -Variable mainOutTee
+$rc = $LASTEXITCODE
+$mainOutput = ""
+if ($mainOutTee) {
+  $mainOutput = (($mainOutTee | Out-String) -replace "`r?`n$", "")
+  Log-Raw ("[主链输出]`n" + $mainOutput)
+}
+
+# 5. 失败路径: 自动采集诊断日志 (默认开启; -NoPanicDiag 关闭)
+#    采集只读、仅在主链退出后执行, 不会引发 panic; 内容面向 AI/维护者分析.
+if ($rc -ne 0 -and -not $NoPanicDiag) {
+  $mode = "failure"
+  if (-not (Get-DeviceOnline)) {
+    Say "设备当前离线, 等待重启完成 (最长 12 分钟)..."
+    if (Wait-DeviceOnline) {
+      $bidNow = Get-BootIdNow
+      if ($bidNow -and $bootIdBefore -and $bidNow -ne $bootIdBefore) { $mode = "panic" }
+    } else {
+      $mode = "offline"; SayErr "设备长时间未恢复, 请手动确认手机状态 (诊断仍会保存 host 侧日志)"
+    }
+  } else {
+    $bidNow = Get-BootIdNow
+    if ($bidNow -and $bootIdBefore -and $bidNow -ne $bootIdBefore) { $mode = "panic" }
+  }
+
+  if ($mode -eq "panic") { SayWarn "检测到异常重启 (panic/watchdog), 自动采集诊断日志 ..." }
+  else { SayWarn "主链失败 (退出码 $rc) 但设备未重启, 自动采集现场诊断日志 ..." }
+
+  $ts = Get-Date -Format "yyyyMMdd_HHmmss"
+  $diagDir = Join-Path $env:TEMP ("ghostlock_diag_" + $ts)
+  Say "采集目录: $diagDir"
+  $manifest = Collect-PanicDiag $diagDir -Mode $mode
+
+  # 附上主链完整输出 (各阶段/报错) 与 root.ps1 自身日志
+  if ($mainOutput) {
+    $f98 = Join-Path $diagDir "98_main_chain.log"
+    $mainOutput | Out-File -FilePath $f98 -Encoding utf8
+    $manifest.files += @{ name = "98_main_chain.log"; size = (Get-Item $f98).Length; note = "主链完整输出 (各阶段/报错, 定位失败阶段)" }
+  }
+  if ($LOG_FILE -and (Test-Path -LiteralPath $LOG_FILE)) {
+    Copy-Item -LiteralPath $LOG_FILE (Join-Path $diagDir "97_root_console.log") -Force
+    $manifest.files += @{ name = "97_root_console.log"; size = (Get-Item (Join-Path $diagDir "97_root_console.log")).Length; note = "root.ps1 自身运行日志" }
+  }
+  # 98/97 已追加 -> 重写索引, 保持 manifest 与 zip 内容一致 (AI 可读性)
+  $manifest | ConvertTo-Json -Depth 6 | Out-File -FilePath (Join-Path $diagDir "00_manifest.json") -Encoding utf8
+  "附加: 98_main_chain.log / 97_root_console.log (host 侧完整日志, 定位失败阶段)" | Out-File -FilePath (Join-Path $diagDir "00_manifest.txt") -Encoding utf8 -Append
+
+  $zip = Join-Path (Get-Location).Path ("ghostlock_diag_" + $ts + ".zip")
+  try {
+    Compress-Archive -Path (Join-Path $diagDir "*") -DestinationPath $zip -Force
+  } catch {
+    $zip = Join-Path $env:TEMP ("ghostlock_diag_" + $ts + ".zip")
+    Compress-Archive -Path (Join-Path $diagDir "*") -DestinationPath $zip -Force
+  }
+  if (-not (Test-Path -LiteralPath $zip)) {
+    SayErr "诊断日志打包失败, 原始目录保留在: $diagDir (可直接打包该目录发送)"
+    $zip = $diagDir
+  }
+  Show-PanicGuide $zip $manifest $mode
+} elseif ($rc -ne 0) {
+  SayErr "-NoPanicDiag: 未采集诊断; 如需分析请发送运行日志: $LOG_FILE"
+}
+exit $rc

