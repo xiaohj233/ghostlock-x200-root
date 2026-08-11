@@ -19,6 +19,11 @@ su_daemon_aarch64_pie
 *.so
 # local release-asset staging (download from GitHub Release)
 prebuilt/
+# root.ps1 依赖下载到项目根目录 (-DepsInPackage / -DepsDir <包根>)
+/platform-tools/
+/payload-dumper-go/
+/platform-tools-latest-windows.zip
+/payload-dumper-go_windows_amd64.tar.gz
 # python
 __pycache__/
 *.pyc

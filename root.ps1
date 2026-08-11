@@ -18,6 +18,8 @@
 #   powershell -ExecutionPolicy Bypass -File root.ps1 -AssetPath C:\path\boot.img
 #   powershell -ExecutionPolicy Bypass -File root.ps1 -SkipPermissiveRestore
 #   powershell -ExecutionPolicy Bypass -File root.ps1 -SkipDeps   # 不自动下载任何依赖
+#   powershell -ExecutionPolicy Bypass -File root.ps1 -NoLog       # 不写日志 (默认每次自动写 %TEMP%\ghostlock_root_<时间戳>.log)
+#   powershell -ExecutionPolicy Bypass -File root.ps1 -DepsInPackage  # 依赖下载到项目根目录 (打包发布用)
 # 自动依赖下载 (开箱即用, 写入 %LOCALAPPDATA%\GhostLock-X200\deps, 不进仓库):
 #   adb (platform-tools 官方) / Python 依赖 (pip) / payload-dumper-go (GitHub release)
 #   / vmlinux-to-elf (pip, GPL-3.0) — 均在缺失且联网时自动获取; -SkipDeps 关闭.
@@ -31,7 +33,10 @@ param(
   [switch]$SkipPermissiveRestore,  # 透传: 不加载 permissive_restore.ko
   [string]$Python,         # python 解释器 (缺省自动探测)
   [switch]$SkipDeps,       # 不自动下载依赖 (离线/审查场景)
-  [string]$DepsDir         # 依赖下载目录 (默认 %LOCALAPPDATA%\GhostLock-X200\deps)
+  [string]$DepsDir,        # 依赖下载目录 (默认 %LOCALAPPDATA%\GhostLock-X200\deps; 可指定项目根目录打包)
+  [switch]$DepsInPackage,  # 依赖下载到项目根目录 (等价 -DepsDir <包根>; 发布离线包用)
+  [switch]$NoLog,          # 不写日志 (默认每次自动写 %TEMP%\ghostlock_root_<时间戳>.log)
+  [string]$LogPath         # 日志文件路径 (默认 %TEMP%\ghostlock_root_<时间戳>.log)
 )
 $ErrorActionPreference = 'SilentlyContinue'
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -40,10 +45,33 @@ $EXPECTED_KERNEL = "b57af212129c"
 $KERNEL_ELF_PAT  = $null   # 本次生成/找到的 kernel ELF
 $GEN_WIN_OFFS    = $null   # 本次生成的 win_offs json
 
-function Say($m) { Write-Host $m }
-function SayWarn($m) { Write-Host "[!] $m" -ForegroundColor Yellow }
-function SayErr($m) { Write-Host "[X] $m" -ForegroundColor Red }
-function SayOk($m) { Write-Host "[OK] $m" -ForegroundColor Green }
+# ---------- 日志 (默认开启: 所有 Say*/子进程输出统一落盘; -NoLog 关闭) ----------
+$LOG_FILE = $null
+if (-not $NoLog) {
+  if (-not $LogPath) { $LogPath = Join-Path $env:TEMP ("ghostlock_root_" + (Get-Date -Format "yyyyMMdd_HHmmss") + ".log") }
+  try {
+    $logDir = Split-Path $LogPath -Parent
+    if (-not $logDir) { $logDir = (Get-Location).Path }
+    if ($logDir) { New-Item -ItemType Directory -Force -Path $logDir | Out-Null }
+    $LOG_FILE = (Resolve-Path $logDir).Path + "\" + (Split-Path $LogPath -Leaf)
+    "" | Out-File -FilePath $LOG_FILE -Encoding utf8
+  } catch { $LOG_FILE = $null }
+}
+
+function Log-Raw([string]$m) {
+  if ($LOG_FILE) { ("[" + (Get-Date -Format "HH:mm:ss") + "] " + $m) | Out-File -FilePath $LOG_FILE -Encoding utf8 -Append }
+}
+
+function Show-Tail([string]$text, [int]$n = 20) {
+  @($text -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -Last $n) | ForEach-Object { SayErr "  $_" }
+}
+
+function Say($m) { Write-Host $m; Log-Raw $m }
+function SayWarn($m) { Write-Host "[!] $m" -ForegroundColor Yellow; Log-Raw "[!] $m" }
+function SayErr($m) { Write-Host "[X] $m" -ForegroundColor Red; Log-Raw "[X] $m" }
+function SayOk($m) { Write-Host "[OK] $m" -ForegroundColor Green; Log-Raw "[OK] $m" }
+
+if ($LOG_FILE) { SayOk "日志文件: $LOG_FILE" }
 
 # ---------- GUI 文件选择 (小白友好) ----------
 function Pick-File {
@@ -91,7 +119,16 @@ function Get-FileKind {
   if ($ext -eq ".img") { return "bootimg" }
   if ($ext -eq ".bin") { return "payload" }
   if ($ext -eq ".elf") { return "kernel_elf" }
+  if ($ext -eq ".raw") { return "kernel_raw" }
   return "unknown"
+}
+
+# Windows 路径 -> WSL 路径 (任意盘符, 旧实现只处理 D: 导致 C 盘 TEMP 时转换失败)
+function ConvertTo-WslPath {
+  param([string]$Path)
+  $p = $Path -replace '\\','/'
+  if ($p -match '^([A-Za-z]):(.*)$') { return ("/mnt/" + $matches[1].ToLower() + $matches[2]) }
+  return $p
 }
 
 # ---------- 工具探测 ----------
@@ -131,6 +168,13 @@ function Find-PayloadTool {
       (Join-Path $pkgRoot "tools\payload_dumper.py"))) {
     if (Test-Path $cand) { return @{ type="py"; cmd=$cand } }
   }
+  # 3) 已下载的 payload-dumper-go (DepsDir: 项目根目录 或 %LOCALAPPDATA% 旧位置)
+  $dep = Get-DepsDir
+  foreach ($cand in @(
+      (Join-Path $dep "payload-dumper-go\payload-dumper-go.exe"),
+      (Join-Path $dep "payload-dumper-go\payload-dumper-go"))) {
+    if (Test-Path $cand) { return @{ type="go"; cmd=$cand } }
+  }
   return $null
 }
 
@@ -159,7 +203,8 @@ function Find-Adb {
       "$env:USERPROFILE\scoop\apps\platform-tools\current\adb.exe",
       "C:\ProgramData\chocolatey\bin\adb.exe",
       "C:\platform-tools\adb.exe",
-      (Join-Path $env:LOCALAPPDATA "GhostLock-X200\deps\platform-tools\adb.exe"))) {
+      (Join-Path $env:LOCALAPPDATA "GhostLock-X200\deps\platform-tools\adb.exe"),
+      (Join-Path (Get-DepsDir) "platform-tools\adb.exe"))) {
     if (Test-Path $cand) { return $cand }
   }
   return $null
@@ -167,10 +212,12 @@ function Find-Adb {
 
 # ---------- 依赖自动下载 (开箱即用; -SkipDeps 关闭) ----------
 function Get-DepsDir {
-  if ($DepsDir) { New-Item -ItemType Directory -Force -Path $DepsDir | Out-Null; return $DepsDir }
-  $d = Join-Path $env:LOCALAPPDATA "GhostLock-X200\deps"
+  # 优先级: -DepsDir 显式指定 > -DepsInPackage (项目根目录) > 默认 %LOCALAPPDATA% 旧位置 (兼容)
+  if ($DepsDir) { $d = $DepsDir }
+  elseif ($DepsInPackage) { $d = $pkgRoot }
+  else { $d = Join-Path $env:LOCALAPPDATA "GhostLock-X200\deps" }
   New-Item -ItemType Directory -Force -Path $d | Out-Null
-  return $d
+  return [System.IO.Path]::GetFullPath($d)
 }
 
 function Test-PyDeps {
@@ -327,18 +374,19 @@ function Step-PayloadToBoot {
   Say "用 payload 工具提取 boot.img ..."
   if ($tool.type -eq "go") {
     Push-Location $OutDir
-    & $tool.cmd $PayloadPath 2>&1 | Out-Null
+    $output = (& $tool.cmd $PayloadPath 2>&1 | Out-String)
     Pop-Location
   } elseif ($tool.type -eq "py") {
     $py = Find-Python
-    & $py $tool.cmd $PayloadPath --out $OutDir --images boot 2>&1 | Out-Null
+    $output = (& $py $tool.cmd $PayloadPath --out $OutDir --images boot 2>&1 | Out-String)
   }
+  Log-Raw ("[payload 提取]`n" + $output)
   $boot = Join-Path $OutDir "boot.img"
   if (-not (Test-Path $boot)) {
     # 有些工具输出到 out/ 或直接当前目录
     $boot = (Get-ChildItem $OutDir -Recurse -Filter "boot.img" -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
   }
-  if (-not $boot) { SayErr "payload 提取未产生 boot.img, 请手动解包后重跑"; return $null }
+  if (-not $boot) { SayErr "payload 提取未产生 boot.img, 请手动解包后重跑"; Show-Tail $output; return $null }
   SayOk "boot.img 已提取: $boot"
   return $boot
 }
@@ -351,12 +399,20 @@ function Step-BootToRaw {
   if (-not $py) { SayErr "未找到 Python"; return $null }
   New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
   Push-Location $OutDir
-  & $py $unpack $BootImg $OutDir 2>&1 | Out-Null
+  $output = (& $py $unpack $BootImg $OutDir 2>&1 | Out-String)
   Pop-Location
+  Log-Raw ("[unpack_boot.py]`n" + $output)
   $raw = Join-Path $OutDir "kernel.raw"
   if (-not (Test-Path $raw)) { $raw = Join-Path $OutDir "Image" }
-  if (-not (Test-Path $raw)) { SayErr "unpack_boot.py 未产出 kernel.raw/Image"; return $null }
-  SayOk "kernel 镜像已解出: $raw"
+  if (-not (Test-Path $raw)) { SayErr "unpack_boot.py 未产出 kernel.raw/Image"; Show-Tail $output; return $null }
+  $rawSize = (Get-Item $raw).Length
+  if ($rawSize -lt 1MB) {
+    SayErr ("kernel.raw 过小 (" + $rawSize + " 字节), 此镜像不含内核, 疑似选成了 init_boot.img / vendor_boot.img")
+    SayErr "请改选 boot.img (payload 里的 boot 分区), 或直接选全量包 zip / payload.bin 让脚本自动解包"
+    SayErr "若确认该文件是压缩内核, 可把 kernel.raw 直接作为素材 (-AssetPath) 重试"
+    return $null
+  }
+  SayOk ("kernel 镜像已解出: " + $raw + " (" + $rawSize + " 字节)")
   return $raw
 }
 
@@ -369,16 +425,24 @@ function Step-RawToElf {
     return $null
   }
   $out = Join-Path $OutDir "kernel.elf"
+  $output = ""
   if ($tool.type -eq "bin") {
-    & $tool.cmd $Raw $out 2>&1 | Out-Null
+    $output = (& $tool.cmd $Raw $out 2>&1 | Out-String)
   } elseif ($tool.type -eq "pymod") {
-    & $tool.cmd -m vmlinux_to_elf $Raw $out 2>&1 | Out-Null
+    $output = (& $tool.cmd -m vmlinux_to_elf $Raw $out 2>&1 | Out-String)
   } elseif ($tool.type -eq "wslbin") {
-    $wRaw = ($Raw -replace '\\','/').Replace('D:','/mnt/d')
-    $wOut = ($out -replace '\\','/').Replace('D:','/mnt/d')
-    & wsl -d kali-linux -- bash -lc "vmlinux-to-elf $wRaw $wOut" 2>&1 | Out-Null
+    $wRaw = ConvertTo-WslPath $Raw
+    $wOut = ConvertTo-WslPath $out
+    $output = (& wsl -d kali-linux -- bash -lc "vmlinux-to-elf '$wRaw' '$wOut'" 2>&1 | Out-String)
   }
-  if (-not (Test-Path $out)) { SayErr "vmlinux-to-elf 转换失败 (无输出 kernel.elf)"; return $null }
+  Log-Raw ("[vmlinux-to-elf]`n" + $output)
+  if (-not (Test-Path $out)) {
+    SayErr "vmlinux-to-elf 转换失败 (无输出 kernel.elf)"
+    SayErr "--- vmlinux-to-elf 原始输出 (最后 20 行) ---"
+    Show-Tail $output
+    SayErr "--- 结束 ---"
+    return $null
+  }
   SayOk "kernel ELF 已生成: $out"
   return $out
 }
@@ -392,9 +456,11 @@ function Step-ElfToWinOffs {
   New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
   $out = Join-Path $OutDir ("win_offs_" + (Split-Path $Elf -Leaf).Replace('.','_') + ".json")
   Push-Location $OutDir
-  & $py $oa winoffs $Elf $out 2>&1 | Select-Object -Last 3 | ForEach-Object { Say "winoffs: $_" }
+  $output = (& $py $oa winoffs $Elf $out 2>&1 | Out-String)
   Pop-Location
-  if (-not (Test-Path $out)) { SayErr "offsets_auto.py winoffs 失败 (无输出)"; return $null }
+  Log-Raw ("[winoffs]`n" + $output)
+  @($output -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -Last 3) | ForEach-Object { Say "winoffs: $_" }
+  if (-not (Test-Path $out)) { SayErr "offsets_auto.py winoffs 失败 (无输出)"; Show-Tail $output; return $null }
   SayOk "win_offs 已生成: $out"
   return $out
 }
@@ -407,6 +473,7 @@ function Build-WinOffsFromAsset {
   $elf = $null
   switch ($kind) {
     "kernel_elf" { $elf = $Asset }
+    "kernel_raw" { $elf = Step-RawToElf $Asset $WorkDir }
     "bootimg" {
       $raw = Step-BootToRaw $Asset $WorkDir
       if (-not $raw) { return $null }

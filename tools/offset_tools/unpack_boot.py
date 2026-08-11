@@ -18,6 +18,9 @@ def unpack(path, outdir):
     kernel_size = struct.unpack_from('<I', data, 0x08)[0]
     page_size = struct.unpack_from('<I', data, 0x24)[0]
     print('kernel_size:', hex(kernel_size), 'page_size:', page_size)
+    if kernel_size == 0:
+        print('no kernel in this image (kernel_size=0): likely init_boot/vendor_boot; use boot.img instead')
+        return
     if ver <= 2:
         kernel_offset = page_size
     else:
