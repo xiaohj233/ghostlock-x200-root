@@ -19,8 +19,9 @@
 #   powershell -ExecutionPolicy Bypass -File root.ps1 -SkipPermissiveRestore
 #   powershell -ExecutionPolicy Bypass -File root.ps1 -SkipDeps   # 不自动下载任何依赖
 #   powershell -ExecutionPolicy Bypass -File root.ps1 -NoLog       # 不写日志 (默认每次自动写 %TEMP%\ghostlock_root_<时间戳>.log)
-#   powershell -ExecutionPolicy Bypass -File root.ps1 -DepsInPackage  # 依赖下载到项目根目录 (打包发布用)
-# 自动依赖下载 (开箱即用, 写入 %LOCALAPPDATA%\GhostLock-X200\deps, 不进仓库):
+#   powershell -ExecutionPolicy Bypass -File root.ps1 -DepsInPackage  # 依赖下载到项目根目录 (v1.1.0 起为默认)
+# 自动依赖下载 (开箱即用, 默认写入项目根目录 platform-tools/、payload-dumper-go/ 等,
+#   包内自包含; 项目根不可写时自动回退 %LOCALAPPDATA%\GhostLock-X200\deps 旧位置):
 #   adb (platform-tools 官方) / Python 依赖 (pip) / payload-dumper-go (GitHub release)
 #   / vmlinux-to-elf (pip, GPL-3.0) — 均在缺失且联网时自动获取; -SkipDeps 关闭.
 # 异常重启诊断 (默认开启): 主链失败后自动采集诊断日志 (检测到重启则含 pstore/AEE 等
@@ -35,11 +36,13 @@ param(
   [switch]$SkipPermissiveRestore,  # 透传: 不加载 permissive_restore.ko
   [string]$Python,         # python 解释器 (缺省自动探测)
   [switch]$SkipDeps,       # 不自动下载依赖 (离线/审查场景)
-  [string]$DepsDir,        # 依赖下载目录 (默认 %LOCALAPPDATA%\GhostLock-X200\deps; 可指定项目根目录打包)
-  [switch]$DepsInPackage,  # 依赖下载到项目根目录 (等价 -DepsDir <包根>; 发布离线包用)
+  [string]$DepsDir,        # 依赖下载目录 (默认项目根目录; 可指定其他目录)
+  [switch]$DepsInPackage,  # 依赖下载到项目根目录 (v1.1.0 起为默认行为, 保留兼容)
   [switch]$NoLog,          # 不写日志 (默认每次自动写 %TEMP%\ghostlock_root_<时间戳>.log)
-  [string]$LogPath,        # 日志文件路径 (默认 %TEMP%\ghostlock_root_<时间戳>.log)
-  [switch]$NoPanicDiag     # 主链失败后不自动采集 panic 诊断日志 (默认开启)
+  [string]$LogPath,        # 日志文件路径 (默认 <包根>\log\ghostlock_root_<时间戳>.log)
+  [switch]$NoPanicDiag,    # 主链失败后不自动采集 panic 诊断日志 (默认开启)
+  [string]$Profile,        # 机型 profile (默认 tools/offset_tools/profiles/x200_b57.json; 新机型: 复制改名填写)
+  [string]$KernelRelease   # 目标内核完整 UTS_RELEASE (如 /proc/version 第 3 字段); 与 profile 不同时自动重打 ko vermagic
 )
 $ErrorActionPreference = 'SilentlyContinue'
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -57,21 +60,41 @@ if (Test-Path (Join-Path $pkgRoot "tools\scripts\find_adb.ps1")) {
     return (Get-Command adb -ErrorAction SilentlyContinue).Source
   }
 }
-$EXPECTED_KERNEL = "b57af212129c"
 $KERNEL_ELF_PAT  = $null   # 本次生成/找到的 kernel ELF
 $GEN_WIN_OFFS    = $null   # 本次生成的 win_offs json
 
-# ---------- 日志 (默认开启: 所有 Say*/子进程输出统一落盘; -NoLog 关闭) ----------
+# ---------- 机型模块 (v1.4: devices/ 可分享模块, 自动匹配) ----------
+$ProfilePath = $Profile
+if (-not $ProfilePath) { $ProfilePath = Join-Path $pkgRoot "devices\x200_b57\device.json" }
+$ProfileInfo = @{}
+try {
+  if (Test-Path -LiteralPath $ProfilePath) {
+    $ProfileInfo = Get-Content -LiteralPath $ProfilePath -Raw -Encoding UTF8 | ConvertFrom-Json
+  } else {
+    SayWarn "机型模块不存在: $ProfilePath (缺省 devices/x200_b57; 未收录机型将自动生成)"
+  }
+} catch { SayWarn "机型模块读取失败: $_" }
+
+# ---------- 日志 (默认开启: 统一写入 <包根>\log\ 文件夹; -NoLog 关闭) ----------
 $LOG_FILE = $null
 if (-not $NoLog) {
-  if (-not $LogPath) { $LogPath = Join-Path $env:TEMP ("ghostlock_root_" + (Get-Date -Format "yyyyMMdd_HHmmss") + ".log") }
+  if (-not $LogPath) { $LogPath = Join-Path $pkgRoot ("log\ghostlock_root_" + (Get-Date -Format "yyyyMMdd_HHmmss") + ".log") }
   try {
     $logDir = Split-Path $LogPath -Parent
     if (-not $logDir) { $logDir = (Get-Location).Path }
-    if ($logDir) { New-Item -ItemType Directory -Force -Path $logDir | Out-Null }
+    New-Item -ItemType Directory -Force -Path $logDir -ErrorAction Stop | Out-Null
     $LOG_FILE = (Resolve-Path $logDir).Path + "\" + (Split-Path $LogPath -Leaf)
-    "" | Out-File -FilePath $LOG_FILE -Encoding utf8
-  } catch { $LOG_FILE = $null }
+    "" | Out-File -FilePath $LOG_FILE -Encoding utf8 -ErrorAction Stop
+  } catch {
+    # log 目录不可写时回退 %TEMP%
+    $LOG_FILE = $null
+    try {
+      $tmpLog = Join-Path $env:TEMP ("ghostlock_root_" + (Get-Date -Format "yyyyMMdd_HHmmss") + ".log")
+      New-Item -ItemType Directory -Force -Path (Split-Path $tmpLog) -ErrorAction Stop | Out-Null
+      "" | Out-File -FilePath $tmpLog -Encoding utf8 -ErrorAction Stop
+      $LOG_FILE = $tmpLog
+    } catch { $LOG_FILE = $null }
+  }
 }
 
 function Log-Raw([string]$m) {
@@ -132,11 +155,313 @@ function Get-FileKind {
   if ($head -like "ANDROID!*") { return "bootimg" }
   if ($head -like "`x7fELF*") { return "kernel_elf" }
   # 无魔数但扩展名提示
-  if ($ext -eq ".img") { return "bootimg" }
+  if ($ext -eq ".img") {
+    # 裸内核 Image (.img 无 ANDROID! 头): 探测 arm64 Image magic / 压缩魔数
+    try {
+      $fs = [System.IO.File]::OpenRead($Path)
+      $b = New-Object byte[] 0x40
+      $fs.Read($b, 0, 0x40) | Out-Null
+      $fs.Close()
+      $magic38 = [System.Text.Encoding]::ASCII.GetString($b, 0x38, 4)
+      $lz4 = ($b[0] -eq 0x02 -and $b[1] -eq 0x21 -and $b[2] -eq 0x4c -and $b[3] -eq 0x18)
+      $gzip = ($b[0] -eq 0x1f -and $b[1] -eq 0x8b)
+      $xz = ($b[0] -eq 0xfd -and $b[1] -eq 0x37 -and $b[2] -eq 0x7a -and $b[3] -eq 0x58)
+      if ($magic38 -eq "ARMd" -or $lz4 -or $gzip -or $xz) { return "kernel_raw" }
+    } catch { }
+    return "bootimg"
+  }
   if ($ext -eq ".bin") { return "payload" }
   if ($ext -eq ".elf") { return "kernel_elf" }
   if ($ext -eq ".raw") { return "kernel_raw" }
   return "unknown"
+}
+
+# ---------- 机型模块自动匹配 (v1.4): 按 /proc/version 扫描 devices/ ----------
+function Match-DeviceModule {
+  param([string]$VerLine)
+  $devRoot = Join-Path $pkgRoot "devices"
+  if (-not (Test-Path -LiteralPath $devRoot)) { return $null }
+  $familyHit = $null
+  foreach ($d in @(Get-ChildItem -LiteralPath $devRoot -Directory -ErrorAction SilentlyContinue)) {
+    $djp = Join-Path $d.FullName "device.json"
+    if (-not (Test-Path -LiteralPath $djp)) { continue }
+    try { $dj = Get-Content -LiteralPath $djp -Raw -Encoding UTF8 | ConvertFrom-Json } catch { continue }
+    if ($dj.kernel_release -and $VerLine -like ("*" + $dj.kernel_release + "*")) {
+      return @{ path = $djp; level = "exact"; device = $dj }
+    }
+    if (-not $familyHit -and $dj.family -and $VerLine -like ("*" + $dj.family + "*")) {
+      $familyHit = @{ path = $djp; level = "family"; device = $dj }
+    }
+  }
+  return $familyHit
+}
+
+# ---------- ko vermagic 检测 (v1.6: KMI 自动触发用) ----------
+function Get-KoVermagic {
+  param([string]$Path)
+  try {
+    $b = [System.IO.File]::ReadAllBytes($Path)
+    $txt = [System.Text.Encoding]::ASCII.GetString($b)
+    $m = [regex]::Match($txt, "vermagic=([^\x00]*)")
+    if ($m.Success) { return $m.Groups[1].Value }
+  } catch { }
+  return ""
+}
+
+# ---------- NDK 探测 (v1.7: exploit 自动编译) ----------
+function Find-NDK {
+  # 返回 @{ type="win"; clang=<cmd> } | @{ type="wsl"; ndk_bin=<kali bin> } | $null
+  # 1) Windows NDK: 环境变量 / 常见 SDK ndk / 项目根 ndk
+  foreach ($envvar in @("ANDROID_NDK_HOME", "ANDROID_NDK", "NDK_HOME")) {
+    $ev = [Environment]::GetEnvironmentVariable($envvar)
+    if ($ev -and (Test-Path -LiteralPath $ev)) {
+      $cand = Join-Path $ev "toolchains\llvm\prebuilt"
+      if (Test-Path -LiteralPath $cand) {
+        foreach ($h in @(Get-ChildItem -LiteralPath $cand -Directory -ErrorAction SilentlyContinue)) {
+          $c = Join-Path $h.FullName "bin\aarch64-linux-android28-clang.cmd"
+          if (Test-Path -LiteralPath $c) { return @{ type = "win"; clang = $c } }
+          $ce = Join-Path $h.FullName "bin\aarch64-linux-android28-clang.exe"
+          if (Test-Path -LiteralPath $ce) { return @{ type = "win"; clang = $ce } }
+        }
+      }
+    }
+  }
+  foreach ($base in @((Join-Path $env:LOCALAPPDATA "Android\Sdk\ndk"), "C:\Android\ndk",
+                      (Join-Path $pkgRoot "ndk"))) {
+    if (Test-Path -LiteralPath $base) {
+      foreach ($v in @(Get-ChildItem -LiteralPath $base -Directory -ErrorAction SilentlyContinue)) {
+        foreach ($h in @("windows-x86_64", "linux-x86_64")) {
+          $c = Join-Path $v.FullName ("toolchains\llvm\prebuilt\" + $h + "\bin\aarch64-linux-android28-clang.cmd")
+          if (Test-Path -LiteralPath $c) { return @{ type = "win"; clang = $c } }
+        }
+      }
+    }
+  }
+  # 2) WSL kali NDK (与历史构建同一工具链: /usr/lib/android-ndk)
+  $wsl = wsl -d kali-linux -- bash -c "ls /usr/lib/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang 2>/dev/null || echo MISSING" 2>$null
+  if ($wsl -and $wsl -notmatch "MISSING") {
+    return @{ type = "wsl"; ndk_bin = "/usr/lib/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin" }
+  }
+  return $null
+}
+
+# ---------- NDK 自动下载 (v1.7, Windows 备选; WSL kali 已装时无需) ----------
+function Ensure-NDK {
+  $n = Find-NDK
+  if ($n) {
+    if ($n.type -eq "win") { SayOk "NDK clang: $($n.clang)" }
+    else { SayOk "NDK (WSL kali): $($n.ndk_bin)" }
+    return $n
+  }
+  if ($SkipDeps) { SayErr "未找到 NDK (离线模式 -SkipDeps). 手动: 设置 ANDROID_NDK_HOME, 或 WSL kali 安装 android-ndk"; return $null }
+  SayWarn "未找到 NDK (exploit 编译需要 aarch64-linux-android28-clang)"
+  $resp = Read-Host "是否自动下载 Android NDK r28 (Windows, ~1.1GB, Google 官方) 到项目根? (y/N)"
+  if ($resp -notmatch '^[yY]') { SayErr "已取消; 可设置 ANDROID_NDK_HOME 或 WSL kali 装 NDK 后重试"; return $null }
+  $dep = Get-DepsDir
+  $zip = Join-Path $dep "android-ndk-r28-windows.zip"
+  Say "下载 NDK r28 (约 1.1GB, 仅首次; 之后 deps 复用) ..."
+  $ok = Download-Url "https://dl.google.com/android/repository/android-ndk-r28-windows.zip" $zip
+  if (-not $ok) { SayErr "NDK 下载失败 (需联网). 手动: https://developer.android.com/ndk/downloads"; return $null }
+  Say "解压 NDK ..."
+  $ndkDir = Join-Path $dep "ndk"
+  New-Item -ItemType Directory -Force -Path $ndkDir | Out-Null
+  try { Expand-Archive -LiteralPath $zip -DestinationPath $ndkDir -Force }
+  catch { SayErr "NDK 解压失败: $($_.Exception.Message)"; return $null }
+  $n = Find-NDK
+  if (-not $n) {
+    $c = Get-ChildItem $ndkDir -Recurse -Filter "aarch64-linux-android28-clang.cmd" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($c) { $n = @{ type = "win"; clang = $c.FullName } }
+  }
+  if ($n) { SayOk "NDK 已就绪: $($n.clang)"; return $n }
+  SayErr "NDK 解压后未找到 clang"; return $null
+}
+
+# ---------- exploit 自动编译 (v1.7): 与历史构建同链 (WSL kali NDK + build 脚本) ----------
+# 产物: devices/<id>/prebuilt/glt_esync + w2host (主链默认名)
+function Invoke-ExploitBuild {
+  param([string]$DeviceId)
+  $ndk = Ensure-NDK
+  if (-not $ndk) { return $null }
+  $devDir = Join-Path $pkgRoot ("devices\" + $DeviceId)
+  $prebuilt = Join-Path $devDir "prebuilt"
+  New-Item -ItemType Directory -Force -Path $prebuilt | Out-Null
+  $tmp = Join-Path $env:TEMP ("gl_build_" + $DeviceId + "_" + (Get-Date -Format "HHmmss"))
+  New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+  $tmpWsl = ConvertTo-WslPath $tmp
+  $gltOut = Join-Path $prebuilt "glt_esync"
+  $ok = $true
+  try {
+    if ($ndk.type -eq "wsl") {
+      # 与历史构建完全一致: WSL kali NDK + 仓库 build 脚本 (仅 glt 按机型编译;
+      # w2host 采样窗口/候选范围运行时注入 W2_CRED_IPS 等, 无需重编, 复用仓库 prebuilt/w2host)
+      $gltScript = ConvertTo-WslPath (Join-Path $pkgRoot "exploit\build\build_glt_esync.sh")
+      $r = wsl -d kali-linux -- bash $gltScript -o $tmpWsl -t $DeviceId -n $ndk.ndk_bin 2>&1
+      if ($LASTEXITCODE -ne 0) { SayErr "glt 编译失败: $($r | Select-Object -Last 3)"; $ok = $false }
+      $gltRaw = Join-Path $tmp ("glt-" + $DeviceId + "-v1.0.elf")
+      if ($ok -and (Test-Path -LiteralPath $gltRaw)) { Copy-Item -LiteralPath $gltRaw -Destination $gltOut -Force }
+      elseif ($ok) { SayErr "glt 产物缺失"; $ok = $false }
+    } else {
+      # Windows NDK 直编 (与 build 脚本等价命令)
+      $clang = $ndk.clang
+      $src = Join-Path $pkgRoot "exploit\src"
+      $vendored = Join-Path $pkgRoot "exploit\vendored"
+      $assets = Join-Path $pkgRoot "exploit\assets"
+      $bd = Join-Path $tmp ".gl_build"
+      New-Item -ItemType Directory -Force -Path (Join-Path $bd "build\embed") | Out-Null
+      New-Item -ItemType Directory -Force -Path (Join-Path $bd "assets") | Out-Null
+      Copy-Item (Join-Path $assets "wallpaper.webp") (Join-Path $bd "assets\") -Force
+      Push-Location $bd
+      $r = & $clang -O2 -fPIE -pie -o (Join-Path $bd "build\embed\su_daemon_aarch64_pie") (Join-Path $src "su_daemon.c") 2>&1
+      if ($LASTEXITCODE -ne 0) { SayErr "su_daemon 编译失败: $r"; $ok = $false }
+      Pop-Location
+      if ($ok) {
+        Push-Location $bd
+        $r = & $clang -O2 -static "-DTARGET_CONFIG_H=`"target.h`"" -I $src -I $vendored -I $devDir `
+          -o $gltOut (Join-Path $src "main.c") (Join-Path $src "slide.c") (Join-Path $src "fops.c") `
+          (Join-Path $src "util.c") (Join-Path $src "root.c") (Join-Path $src "pipe.c") `
+          (Join-Path $src "preload.c") (Join-Path $src "su_blob.S") (Join-Path $src "wallpaper_blob.S") `
+          (Join-Path $src "standalone_main.c") 2>&1
+        if ($LASTEXITCODE -ne 0) { SayErr "glt 编译失败: $r"; $ok = $false }
+        Pop-Location
+      }
+    }
+  } finally {
+    $tmpFull = [System.IO.Path]::GetFullPath($tmp)
+    $tempFull = [System.IO.Path]::GetFullPath($env:TEMP)
+    if ($tmpFull.StartsWith($tempFull)) { Remove-Item -LiteralPath $tmpFull -Recurse -Force -ErrorAction SilentlyContinue }
+  }
+  if (-not $ok) { return $null }
+  if (Test-Path -LiteralPath $gltOut) {
+    SayOk "exploit 自动编译完成: $gltOut (w2host 运行时自适应, 复用仓库 prebuilt/w2host)"
+    return @{ glt = $gltOut }
+  }
+  SayErr "glt 产物缺失"; return $null
+}
+
+# ---------- 新机型偏移重建 (v1.6): 素材 -> package -> KMI 自动 -> prebuilt 门禁 ----------
+# 设置脚本级: $GEN_WIN_OFFS / $ProfilePath / $ProfileInfo / $ModuleW2 / $ModuleGlt / $KO_ADAPTED / $PR_ADAPTED
+# 返回: hashtable (ok) | "cancelled" | $null (失败)
+function Invoke-DeviceBuild {
+  param([string]$Asset, [string]$WorkDir)
+  $oa = Join-Path $pkgRoot "tools\offset_tools\offsets_auto.py"
+  $python = Find-Python
+  if (-not $python) { SayErr "未找到 Python"; return $null }
+
+  # 1. 素材预处理: zip/payload 先解出 boot.img/kernel.raw (package 需要 bootimg/raw/elf)
+  $pkgAsset = $Asset
+  $kind = Get-FileKind $Asset
+  if ($kind -eq "fullzip" -or $kind -eq "payload") {
+    Say "素材为 $kind, 先解出 boot.img ..."
+    $payload = $Asset
+    if ($kind -eq "fullzip") {
+      $payload = Join-Path $WorkDir "payload.bin"
+      Say "全量包 zip: 查找 payload.bin ..."
+      try {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $z = [System.IO.Compression.ZipFile]::OpenRead($Asset)
+        $entry = $z.Entries | Where-Object { $_.FullName -match "payload\.bin$" } | Select-Object -First 1
+        if ($entry) {
+          [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $payload, $true)
+          SayOk "payload.bin 已解出: $payload"
+        }
+        $z.Dispose()
+      } catch { }
+      if (-not (Test-Path -LiteralPath $payload)) { SayErr "zip 中未找到 payload.bin"; return $null }
+    }
+    $boot = Step-PayloadToBoot $payload $WorkDir
+    if (-not $boot) { return $null }
+    $pkgAsset = $boot
+    $raw = Step-BootToRaw $boot $WorkDir
+    if ($raw) { $pkgAsset = $raw }
+  } elseif ($kind -eq "bootimg") {
+    $raw = Step-BootToRaw $Asset $WorkDir
+    if ($raw) { $pkgAsset = $raw }
+  }
+  SayOk "package 素材: $pkgAsset"
+
+  # 2. package 主导 (offline+winoffs-image+pselect+header -> devices/<id>/)
+  $newDevId = "auto_" + (Get-Date -Format "yyyyMMdd_HHmmss")
+  $newDevDir = Join-Path $pkgRoot ("devices\" + $newDevId)
+  $pkgLog = (& $python $oa package $pkgAsset --out $newDevDir --device-id $newDevId 2>&1 | Out-String)
+  Log-Raw ("[package]`n" + $pkgLog)
+  @($pkgLog -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -Last 16) | ForEach-Object { Say $_ }
+  $newWin = Join-Path $newDevDir "win_offs.json"
+  if (-not (Test-Path -LiteralPath $newWin)) {
+    SayErr "机型模块生成未产出 win_offs.json (素材解包/提取失败)"; return $null
+  }
+  $script:GEN_WIN_OFFS = $newWin
+  $script:ProfilePath = Join-Path $newDevDir "device.json"
+  try { $script:ProfileInfo = Get-Content -LiteralPath $script:ProfilePath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { }
+  SayOk "已生成机型模块: $newDevDir (分享: 打包该目录或拷贝到他人 devices/)"
+
+  # 3. KMI 自动: 模块 kernel_release vs ko vermagic (-KernelRelease 手动覆盖)
+  $script:KO_ADAPTED = $null
+  $script:PR_ADAPTED = $null
+  $krel = [string]$script:ProfileInfo.kernel_release
+  if ($KernelRelease) { $krel = $KernelRelease }
+  if ($krel) {
+    $pv = Join-Path $pkgRoot "modules\kernelsu\patch_vermagic.py"
+    $koSrc = Join-Path $pkgRoot "modules\kernelsu\kernelsu.ko"
+    $koVm = Get-KoVermagic $koSrc
+    if ($koVm -and $koVm -notlike ("*" + $krel + "*")) {
+      SayWarn "kernelsu.ko vermagic 不匹配 ($krel), 自动重打 ..."
+      $koOut = Join-Path $pkgRoot "prebuilt\kernelsu_adapted.ko"
+      $koLog = (& $python $pv $koSrc $koOut --release $krel --no-sha-check 2>&1 | Out-String)
+      Log-Raw ("[patch_vermagic kernelsu]`n" + $koLog)
+      if (Test-Path -LiteralPath $koOut) {
+        $script:KO_ADAPTED = $koOut
+        SayOk "kernelsu.ko 已重打: $koOut"
+        SayWarn "ko 仅改写 vermagic, 不保证 modversions ABI; patch_ko_all 会做符号重定位"
+      } else { SayErr "kernelsu.ko 重打失败"; Show-Tail $koLog }
+    } else { SayOk "kernelsu.ko vermagic 匹配模块内核" }
+    $prSrc = Join-Path $pkgRoot "modules\permissive_restore\permissive_restore.ko"
+    if (Test-Path -LiteralPath $prSrc) {
+      $prVm = Get-KoVermagic $prSrc
+      if ($prVm -and $prVm -notlike ("*" + $krel + "*")) {
+        SayWarn "permissive_restore.ko vermagic 不匹配 ($krel), 自动重打 ..."
+        $prOut = Join-Path $pkgRoot "prebuilt\permissive_restore_adapted.ko"
+        $prLog = (& $python $pv $prSrc $prOut --release $krel --no-sha-check 2>&1 | Out-String)
+        Log-Raw ("[patch_vermagic permissive_restore]`n" + $prLog)
+        if (Test-Path -LiteralPath $prOut) { $script:PR_ADAPTED = $prOut; SayOk "permissive_restore.ko 已重打: $prOut" }
+      }
+    }
+  }
+
+  # 4. prebuilt 门禁 + 模块产物 (devices/<id>/prebuilt/)
+  $script:ModuleW2 = $null
+  $script:ModuleGlt = $null
+  $modW2 = Join-Path $newDevDir "prebuilt\w2host"
+  $modGlt = Join-Path $newDevDir "prebuilt\glt_esync"
+  if ((Test-Path -LiteralPath $modW2) -and (Test-Path -LiteralPath $modGlt)) {
+    $script:ModuleW2 = $modW2
+    $script:ModuleGlt = $modGlt
+    SayOk "模块自带 w2host/glt 产物, 主链将使用"
+  } elseif (Test-Path -LiteralPath $modGlt) {
+    # w2host 采样窗口/候选范围运行时注入 (W2_CRED_IPS 等), 无需按机型重编,
+    # 主链回退仓库 prebuilt/w2host 即可
+    $script:ModuleGlt = $modGlt
+    SayOk "模块自带 glt_esync (按本机型编译), w2host 复用仓库 prebuilt (运行时自适应)"
+  } elseif ($script:ProfileInfo.family -and [string]$script:ProfileInfo.family -ne "b57") {
+    SayWarn "非 b57 机型且模块无自带 glt_esync 产物 (prebuilt/glt_esync 为 b57 编译, 偏移不匹配; w2host 运行时自适应可直接用)"
+    $resp = Read-Host "是否自动编译本机型 exploit 产物? (WSL kali NDK / 自动下载 NDK; y/N)"
+    if ($resp -match '^[yY]') {
+      $built = Invoke-ExploitBuild -DeviceId $newDevId
+      if ($built) {
+        $script:ModuleGlt = $built.glt
+        SayOk "主链将使用本机型自动编译产物"
+      } else {
+        SayErr "自动编译未完成; 手动: bash exploit/build/build_glt_esync.sh -t $newDevId -> devices\$newDevId\prebuilt\"
+      }
+    } else {
+      SayWarn "跳过自动编译; 手动: bash exploit/build/build_glt_esync.sh -t $newDevId -> devices\$newDevId\prebuilt\"
+    }
+    if (-not $script:ModuleGlt) {
+      $resp = Read-Host "是否仍用 b57 预编译产物强跑? (y/N)"
+      if ($resp -notmatch '^[yY]') { SayErr "已取消 (主链未运行); 编译产物后再试"; return "cancelled" }
+      SayWarn "继续使用 b57 预编译 glt_esync (偏移不匹配, 风险自担)"
+    }
+  }
+  return @{ ok = $true; win_offs = $newWin; profile_path = $script:ProfilePath }
 }
 
 # Windows 路径 -> WSL 路径 (任意盘符, 旧实现只处理 D: 导致 C 盘 TEMP 时转换失败)
@@ -185,11 +510,12 @@ function Find-PayloadTool {
     if (Test-Path $cand) { return @{ type="py"; cmd=$cand } }
   }
   # 3) 已下载的 payload-dumper-go (DepsDir: 项目根目录 或 %LOCALAPPDATA% 旧位置)
-  $dep = Get-DepsDir
-  foreach ($cand in @(
-      (Join-Path $dep "payload-dumper-go\payload-dumper-go.exe"),
-      (Join-Path $dep "payload-dumper-go\payload-dumper-go"))) {
-    if (Test-Path $cand) { return @{ type="go"; cmd=$cand } }
+  foreach ($dep in @((Get-DepsDir), (Join-Path $env:LOCALAPPDATA "GhostLock-X200\deps"))) {
+    foreach ($cand in @(
+        (Join-Path $dep "payload-dumper-go\payload-dumper-go.exe"),
+        (Join-Path $dep "payload-dumper-go\payload-dumper-go"))) {
+      if (Test-Path $cand) { return @{ type="go"; cmd=$cand } }
+    }
   }
   return $null
 }
@@ -216,11 +542,18 @@ function Find-Adb {
 
 # ---------- 依赖自动下载 (开箱即用; -SkipDeps 关闭) ----------
 function Get-DepsDir {
-  # 优先级: -DepsDir 显式指定 > -DepsInPackage (项目根目录) > 默认 %LOCALAPPDATA% 旧位置 (兼容)
+  # 优先级: -DepsDir 显式指定 > 默认项目根目录 (包内自包含); 项目根不可写时回退 %LOCALAPPDATA% 旧位置
   if ($DepsDir) { $d = $DepsDir }
-  elseif ($DepsInPackage) { $d = $pkgRoot }
-  else { $d = Join-Path $env:LOCALAPPDATA "GhostLock-X200\deps" }
-  New-Item -ItemType Directory -Force -Path $d | Out-Null
+  else { $d = $pkgRoot }
+  try {
+    New-Item -ItemType Directory -Force -Path $d -ErrorAction Stop | Out-Null
+    $probe = Join-Path $d ("__w_" + [guid]::NewGuid().ToString('N'))
+    Set-Content -LiteralPath $probe -Value 'x' -ErrorAction Stop
+    Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue
+  } catch {
+    $d = Join-Path $env:LOCALAPPDATA "GhostLock-X200\deps"
+    New-Item -ItemType Directory -Force -Path $d -ErrorAction SilentlyContinue | Out-Null
+  }
   return [System.IO.Path]::GetFullPath($d)
 }
 
@@ -365,6 +698,7 @@ function Ensure-VmlinuxToElf {
   SayErr "vmlinux-to-elf 安装失败. 请任选其一:"
   SayErr "  Windows: 安装 MSVC C++ Build Tools 后重跑, 或 pip install vmlinux-to-elf"
   SayErr "  WSL:     wsl -d kali-linux -- bash -lc 'pip3 install vmlinux-to-elf'"
+  SayErr "  或:      直接提供现成 kernel.elf 作为素材 (脚本自动识别并跳过此工具)"
   return $null
 }
 
@@ -463,13 +797,45 @@ function Step-ElfToWinOffs {
   New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
   $out = Join-Path $OutDir ("win_offs_" + (Split-Path $Elf -Leaf).Replace('.','_') + ".json")
   Push-Location $OutDir
-  $output = (& $py $oa winoffs $Elf $out 2>&1 | Out-String)
+  $output = (& $py $oa winoffs $Elf $out --profile $ProfilePath 2>&1 | Out-String)
   Pop-Location
   Log-Raw ("[winoffs]`n" + $output)
   @($output -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -Last 3) | ForEach-Object { Say "winoffs: $_" }
   if (-not (Test-Path $out)) { SayErr "offsets_auto.py winoffs 失败 (无输出)"; Show-Tail $output; return $null }
   SayOk "win_offs 已生成: $out"
   return $out
+}
+
+# ---------- kernel.elf 提供引导 (vmlinux-to-elf 不可用时, 主动让用户提供现成文件) ----------
+function Offer-KernelElf {
+  SayErr "本机无法自动转换 kernel.elf (Windows pip 依赖 minilzo, 需 MSVC 编译; 或需 WSL kali-linux)。"
+  Say "获取 kernel.elf 的三种方式 (任选其一):"
+  Say "  A) 在任一装有 WSL(推荐 kali-linux) 的电脑上执行两条命令:"
+  Say "     wsl -d kali-linux -- bash -lc 'pip3 install vmlinux-to-elf'"
+  Say "     wsl -d kali-linux -- bash -lc \"vmlinux-to-elf '/mnt/c/你的路径/kernel.raw' '/mnt/c/你的路径/kernel.elf'\""
+  Say "     (kernel.raw 可由本工具从 boot.img 解出, 脚本会提示路径)"
+  Say "  B) 安装 Windows MSVC C++ Build Tools 后重跑本工具 (自动 pip 安装 vmlinux-to-elf)"
+  Say "  C) 联系维护者: 提供 boot.img / 全量包 zip, 由维护者代转 kernel.elf 后返回;"
+  Say "     或向同机型/同固件的他人索取现成 kernel.elf (本工具支持直接以 kernel.elf 为素材)"
+  $resp = Read-Host "若你已有现成 kernel.elf, 输入 y 选择文件继续; 直接回车则退出"
+  if ($resp -match '^[yY]') {
+    $f = Pick-File "请选择 kernel.elf" "ELF 文件 (*.elf)|*.elf|All files (*.*)|*.*"
+    if ($f -and (Test-Path -LiteralPath $f)) {
+      try {
+        $fs = [System.IO.File]::OpenRead($f)
+        $b = New-Object byte[] 4
+        $fs.Read($b, 0, 4) | Out-Null
+        $fs.Close()
+        if ($b[0] -eq 0x7f -and $b[1] -eq 0x45 -and $b[2] -eq 0x4c -and $b[3] -eq 0x46) {
+          SayOk "kernel.elf 已确认: $f"
+          return $f
+        }
+        SayErr "所选文件不是 ELF 格式, 已取消"; return $null
+      } catch { SayErr "读取文件失败: $_"; return $null }
+    }
+    SayErr "未选择有效文件"; return $null
+  }
+  return $null
 }
 
 # ---------- 一键: 素材 -> win_offs ----------
@@ -517,6 +883,7 @@ function Build-WinOffsFromAsset {
     }
     default { SayErr "无法识别的文件类型: $Asset"; return $null }
   }
+  if (-not $elf) { $elf = Offer-KernelElf }
   if (-not $elf) { SayErr "未能得到 kernel ELF, 无法生成偏移"; return $null }
   $wo = Step-ElfToWinOffs $elf $WorkDir
   return $wo
@@ -594,11 +961,131 @@ function New-DiagEntry {
   return @{ name = $Name; size = $sz; note = $Note }
 }
 
+# ---------- 诊断日志降体积: 关键行提取 + 尾部保留 + 连续重复压缩 ----------
+# 目的: dmesg/pstore 动辄 2-4MB, 大部分是 vendor 刷屏; 关键信息 (panic 栈/错误/
+#       阶段) 集中在尾部与强模式行附近, 摘要后体积可降 10 倍以上且不丢关键证据.
+function Compress-ConsecutiveDup {
+  param([string[]]$Lines)
+  $sb = [System.Text.StringBuilder]::new()
+  $prev = $null
+  $count = 0
+  foreach ($ln in $Lines) {
+    if ($ln -eq $prev) { $count++ }
+    else {
+      if ($null -ne $prev) {
+        if ($count -gt 1) { $null = $sb.AppendLine(("(x{0}) {1}" -f $count, $prev)) }
+        else { $null = $sb.AppendLine($prev) }
+      }
+      $prev = $ln
+      $count = 1
+    }
+  }
+  if ($null -ne $prev) {
+    if ($count -gt 1) { $null = $sb.AppendLine(("(x{0}) {1}" -f $count, $prev)) }
+    else { $null = $sb.AppendLine($prev) }
+  }
+  return $sb.ToString()
+}
+
+function Reduce-DiagText {
+  param([string]$Content, [int]$TailLines = 1500, [int]$Context = 2)
+  if ([string]::IsNullOrEmpty($Content)) { return @{ tail = ''; key = ''; origLines = 0; keyLines = 0 } }
+  $lines = @($Content -split "`n" | ForEach-Object { $_.TrimEnd("`r") })
+  $origLines = $lines.Count
+  # 只匹配真正的内核异常/崩溃模式; \b 词边界防误匹配 (如 debug: 里的 bug:); 不含裸 watchdog
+  $strong = '\bKernel panic\b|\bnot syncing\b|\bBUG\b|\bCall trace\b|\bCall Trace\b|\bUnable to handle\b|\bSError\b|synchronous abort|\bOops\b|\boops\b|\bsoft lockup\b|\bhard lockup\b|rcu.*stall|\buse-after-free\b|\bdouble free\b|\brefcount\b|\bOut of memory\b|\bKilled process\b|\bFATAL\b|\bgeneral protection fault\b|\bNULL pointer dereference\b'
+  $keyIdx = @{}
+  for ($i = 0; $i -lt $lines.Count; $i++) {
+    if ($lines[$i] -match $strong) {
+      for ($j = [Math]::Max(0, $i - $Context); $j -le [Math]::Min($lines.Count - 1, $i + $Context); $j++) {
+        if (-not $keyIdx.ContainsKey($j)) { $keyIdx[$j] = $true }
+      }
+    }
+  }
+  $keyLines = 0
+  $sb = [System.Text.StringBuilder]::new()
+  foreach ($idx in ($keyIdx.Keys | Sort-Object)) {
+    $keyLines++
+    $null = $sb.AppendLine(("L{0}: {1}" -f ($idx + 1), $lines[$idx]))
+  }
+  $tailStart = [Math]::Max(0, $lines.Count - $TailLines)
+  $tail = Compress-ConsecutiveDup $lines[$tailStart..($lines.Count - 1)]
+  return @{ tail = $tail; key = $sb.ToString(); origLines = $origLines; keyLines = $keyLines }
+}
+
+# ---------- AI 速读摘要: 从各采集文件提炼为单文件 00_SUMMARY.txt ----------
+function Build-DiagSummary {
+  param($Manifest, [string]$DiagDir, [string]$MainOutput)
+  $L = [System.Collections.Generic.List[string]]::new()
+  $L.Add('# GhostLock-X200 诊断摘要')
+  $L.Add('')
+  $L.Add('## 1. 设备与内核')
+  $L.Add(('brand=' + $Manifest.device.brand + ' model=' + $Manifest.device.model + ' build=' + $Manifest.device.build + ' sdk=' + $Manifest.device.sdk))
+  $L.Add(('kernel=' + $Manifest.device.kernel_version))
+  $match = [bool]($Manifest.device.kernel_build_hash -and $Manifest.device.kernel_build_hash -eq $Manifest.device.expected_kernel_build)
+  $L.Add(('kernel_build_hash=' + $Manifest.device.kernel_build_hash + ' expected=' + $Manifest.device.expected_kernel_build + ' match=' + $match))
+  $L.Add(('boot_id=' + $Manifest.boot.boot_id))
+  $L.Add(('bootreason=' + $Manifest.boot.reason_raw + '  =>  ' + $Manifest.boot.panic_likely))
+  $L.Add('')
+  $L.Add('## 2. 运行结果')
+  $L.Add(('mode=' + $Manifest.mode + ' collect_time=' + $Manifest.collect_time))
+  $tailLines = @($MainOutput -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -Last 6)
+  if ($tailLines) { $L.AddRange([string[]]$tailLines) }
+  $seq = Get-ChildItem -LiteralPath (Join-Path $DiagDir '06_local_tmp') -Filter 'glt_seq_*.txt' -ErrorAction SilentlyContinue | Sort-Object Name | Select-Object -Last 1
+  if ($seq) {
+    $L.Add('')
+    $L.Add('## 3. 最后动作 (glt_seq 最后 6 行)')
+    $seqLines = @(Get-Content -LiteralPath $seq.FullName | Where-Object { $_.Trim() -and $_.Trim() -notmatch '^#' } | Select-Object -Last 6)
+    if ($seqLines) { $L.AddRange([string[]]$seqLines) }
+  }
+  $psFiles = Get-ChildItem -LiteralPath (Join-Path $DiagDir '02_pstore') -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'ramoops' }
+  if ($psFiles) {
+    $L.Add('')
+    $L.Add('## 4. panic 证据 (pstore 关键行, 每文件前 20 条)')
+    $panicPat = '\bKernel panic\b|\bnot syncing\b|\bBUG\b|\bCall trace\b|\bCall Trace\b|\bUnable to handle\b|\bSError\b|synchronous abort|\bOops\b|\boops\b|\bsoft lockup\b|\bhard lockup\b|rcu.*stall|\buse-after-free\b|\bdouble free\b|\brefcount\b|\bOut of memory\b|\bKilled process\b|\bFATAL\b|\bgeneral protection fault\b|\bNULL pointer dereference\b'
+    foreach ($pf in $psFiles) {
+      $c = Get-Content -LiteralPath $pf.FullName -Raw
+      $keyStart = $c.IndexOf('关键行')
+      if ($keyStart -ge 0) {
+        $keyLines = @($c.Substring($keyStart) -split "`r?`n" | Where-Object { $_ -match '^L[0-9]+: ' -and $_ -match $panicPat } | Select-Object -First 20)
+        if ($keyLines.Count -gt 0) {
+          $L.Add(('--- ' + $pf.Name + ' ---'))
+          $L.AddRange([string[]]$keyLines)
+        }
+      }
+    }
+  }
+  $mod = Get-ChildItem -LiteralPath (Join-Path $DiagDir '06_local_tmp') -Filter 'diag_root_*modules*' -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($mod) {
+    $L.Add('')
+    $L.Add('## 5. 模块状态 (diag_root modules)')
+    $mc = @(Get-Content -LiteralPath $mod.FullName | Where-Object { $_ -match 'kernelsu|permissive_restore' })
+    if ($mc) { $L.AddRange([string[]]$mc) }
+  }
+  $L.Add('')
+  $L.Add('## 6. 结论建议')
+  $hash = $Manifest.device.kernel_build_hash
+  if ($hash -and $hash -ne $Manifest.device.expected_kernel_build) {
+    $L.Add('- 内核构建不匹配预期: 极可能机型/系统版本不兼容; 需按目标内核重新编译/适配模块 (二次开发).')
+  } else {
+    $L.Add('- 内核构建与预期一致: 失败属运行期问题, 以第 2/3 节定位失败阶段与最后动作.')
+  }
+  if ($Manifest.boot.reason_raw -match 'panic|watchdog|wdt') { $L.Add('- 启动原因为 panic/watchdog: 结合第 4 节 pstore 确认崩溃点.') }
+  if ($mod) { $L.Add('- 已到达 STAGE6 root 阶段 (存在 root 级快照): 偏移/提权链路工作正常, 问题在后半段 (INSMOD/验证).') }
+  $L.Add('- 完整细节见各分项文件 (00_manifest.json 索引); 如需完整 dmesg 可另行抓取.')
+  return ($L -join "`n")
+}
+
 function Collect-PanicDiag {
   param([string]$OutDir, [string]$Mode = "failure")   # Mode: panic=异常重启后采集 / failure=未重启现场采集
   New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
   $now = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
   $files = @()
+  # 预期内核构建 hash (v1.4: 从命中机型模块读取, 不再硬编码)
+  $expectedKernel = ""
+  if ($ProfileInfo.kernel_release -and $ProfileInfo.kernel_release -match "g([0-9a-f]{6,})") {
+    $expectedKernel = $matches[1]
+  }
 
   # ---- 01_boot_info.txt: 白名单属性 (不抓全量 getprop, 避免噪音) ----
   $lines = @()
@@ -623,11 +1110,14 @@ function Collect-PanicDiag {
   (AdbSh "ls -la /sys/fs/pstore/ 2>&1") | Out-File (Join-Path $psDir "listing.txt") -Encoding utf8
   $psNames = @((AdbSh "ls /sys/fs/pstore/ 2>/dev/null") -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
   foreach ($n in $psNames) {
+    if ($n -match '^pmsg-') { continue }   # pmsg 为二进制且可能含用户数据, 不采集
     $safe = ($n -replace '[^\w\.\-]', '_')
     $content = AdbSh ("cat /sys/fs/pstore/" + $n + " 2>&1")
-    Write-DiagFile (Join-Path $psDir $safe) ("pstore: " + $n) $content
+    $r = Reduce-DiagText $content 2000 2
+    $body = "===== 关键行 (带上下文, " + $r.keyLines + " 行 / 原文 " + $r.origLines + " 行) =====`n" + $r.key + "`n`n===== 尾部 " + [Math]::Min(2000, $r.origLines) + " 行 (连续重复已压缩) =====`n" + $r.tail
+    Write-DiagFile (Join-Path $psDir $safe) ("pstore: " + $n + " (摘要)") $body ("panic 栈通常在尾部/关键行; 原文 " + $r.origLines + " 行")
   }
-  $files += New-DiagEntry $OutDir "02_pstore" "panic 瞬间内核日志 (dmesg-ramoops-*/console-ramoops-*); listing.txt 记录可读性"
+  $files += New-DiagEntry $OutDir "02_pstore" "panic 瞬间内核日志 (摘要: 尾部+关键行); listing.txt 记录可读性"
 
   # ---- 03_last_kmsg / 04_dmesg: 重启后尽力而为 (受限时注明原因, 不留空噪音) ----
   $lk = AdbSh "cat /proc/last_kmsg 2>&1"
@@ -639,9 +1129,11 @@ function Collect-PanicDiag {
   if ([string]::IsNullOrEmpty($dm)) {
     Write-DiagFile $f "重启后 dmesg 尝试" "" "dmesg 受限 (dmesg_restrict=1, 重启后无 root), 内核日志请以 02_pstore 为准"
   } else {
-    Write-DiagFile $f "重启后 dmesg" $dm "若与 02_pstore 同时存在, 以 pstore 为 panic 主证据"
+    $r = Reduce-DiagText $dm 1500 2
+    $body = "===== 关键行 (带上下文, " + $r.keyLines + " 行 / 原文 " + $r.origLines + " 行) =====`n" + $r.key + "`n`n===== 尾部 " + [Math]::Min(1500, $r.origLines) + " 行 (连续重复已压缩) =====`n" + $r.tail
+    Write-DiagFile $f "重启后 dmesg (摘要)" $body "若与 02_pstore 同时存在, 以 pstore 为 panic 主证据"
   }
-  $files += New-DiagEntry $OutDir "04_dmesg.txt" "重启后 dmesg 尝试"
+  $files += New-DiagEntry $OutDir "04_dmesg.txt" "重启后 dmesg (尾部+关键行摘要)"
 
   # ---- 05_mtk_aee: MTK 异常库目录清单 (仅清单, 不拉全树避免噪音) ----
   $aeeDir = Join-Path $OutDir "05_mtk_aee"
@@ -662,13 +1154,21 @@ function Collect-PanicDiag {
   $tmpNames = @((AdbSh "ls /data/local/tmp/ 2>/dev/null") -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
   foreach ($n in $tmpNames) {
     if ($n -match '^(glt_seq_|w2h_|w2dbg_|w2cred_|rootproof_|dmesg_pre_|run\.sh$|w\.log$|rootcmd_|diag_root_)') {
+      if ($n -match '\.sock$') { continue }   # socket 文件无内容, 跳过
       $safe = ($n -replace '[^\w\.\-]', '_')
       if ($n -match '^diag_root_') {
         # root 级日志快照目录 (STAGE6 有权限时 dump): 逐文件读取
         $sub = @((AdbSh ("ls /data/local/tmp/" + $n + "/ 2>/dev/null")) -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
         foreach ($sn in $sub) {
           $content = AdbSh ("cat /data/local/tmp/" + $n + "/" + $sn + " 2>&1")
-          Write-DiagFile (Join-Path $tmpDir ($safe + "_" + $sn)) ("root 级日志: " + $sn) $content "STAGE6 root 权限阶段 dump (dmesg/kernel logcat/模块/selinux)"
+          if ($sn -match '^dmesg') {
+            # root 快照的 dmesg 可能 4MB+, 同样做尾部+关键行摘要
+            $r = Reduce-DiagText $content 1500 2
+            $body = "===== 关键行 (带上下文, " + $r.keyLines + " 行 / 原文 " + $r.origLines + " 行) =====`n" + $r.key + "`n`n===== 尾部 " + [Math]::Min(1500, $r.origLines) + " 行 (连续重复已压缩) =====`n" + $r.tail
+            Write-DiagFile (Join-Path $tmpDir ($safe + "_" + $sn)) ("root 级日志: " + $sn + " (摘要)") $body "STAGE6 root 权限阶段 dump, dmesg 已摘要"
+          } else {
+            Write-DiagFile (Join-Path $tmpDir ($safe + "_" + $sn)) ("root 级日志: " + $sn) $content "STAGE6 root 权限阶段 dump (kernel logcat/模块/selinux)"
+          }
         }
       } else {
         $cmd = if ($n -match '\.(log|txt)$') { ("tail -n 2000 /data/local/tmp/" + $n + " 2>&1") } else { ("cat /data/local/tmp/" + $n + " 2>&1") }
@@ -691,9 +1191,12 @@ function Collect-PanicDiag {
   $guide = @(
     "本 zip 由 GhostLock-X200 root.ps1 自动采集 (mode=${Mode}: panic=异常重启后 / failure=未重启现场)。",
     "所有 .txt 文件均为 UTF-8 纯文本, 前 4 行为文件头注释 (file/内容/采集时间/备注)。",
+    "大文件 (dmesg/pstore) 已压缩为「尾部+关键行」摘要: L<行号> 对应原文行号,",
+    "连续重复行已折叠为 (xN) 形式; 关键信息 (panic 栈/错误) 在关键行与尾部均完整保留。",
     "采集为只读命令且仅在主链退出后执行, 不会引发 panic。",
     "",
     "推荐分析顺序:",
+    "  0) 00_SUMMARY.txt     -> AI 速读摘要 (设备/失败阶段/最后动作/panic 证据/结论), 优先阅读",
     "  1) 00_manifest.json  -> 机器可读索引 (设备/内核/启动原因/文件清单+用途)",
     "  2) 01_boot_info.txt  -> 确认机型/系统/内核构建与启动原因; kernel.build_hash 与工具预期不一致 = 机型不兼容高概率",
     "  3) 02_pstore/*       -> panic 瞬间内核日志 (最关键): 在 dmesg-ramoops-0/console-ramoops-0 尾部查找",
@@ -706,7 +1209,7 @@ function Collect-PanicDiag {
     "判读线索:",
     "  - 02_pstore 有 dmesg-ramoops-0 且含 panic 栈      -> 内核 panic, 触发点见 06_local_tmp/glt_seq_*",
     "  - bootreason 含 'watchdog'/'wdt'                 -> 看门狗复位 (卡死/软锁), 同样看 glt_seq_*",
-    "  - 01_boot_info kernel.build_hash != 预期 b57af212129c -> 内核不匹配, 极可能机型/系统版本不兼容",
+    "  - 01_boot_info kernel.build_hash != 预期 $expectedKernel -> 内核不匹配, 极可能机型/系统版本不兼容",
     "  - 06_local_tmp 缺失 glt_seq_*                    -> panic 发生在更早阶段, 结合 98_main_chain.log 定位",
     "",
     "非支持机型说明: 本工具官方仅支持预期内核构建的机型; 其他机型仅可用于排查, root 需二次开发适配。"
@@ -720,7 +1223,7 @@ function Collect-PanicDiag {
   $panicLikely = if ($reason -match 'panic|wdt|watchdog') { "内核 panic 或看门狗复位 (需结合 02_pstore 确认)" } else { "异常重启, 原因待确认" }
   $manifest = [ordered]@{
     tool          = "GhostLock-X200 root.ps1"
-    version       = "v1.1.0"
+    version       = "v1.3.0"
     collect_time  = $now
     mode          = $Mode
     device        = [ordered]@{
@@ -730,7 +1233,7 @@ function Collect-PanicDiag {
       sdk                  = (AdbSh "getprop ro.build.version.sdk")
       kernel_version       = $kv
       kernel_build_hash    = (Get-BuildHash $kv)
-      expected_kernel_build = "b57af212129c"
+      expected_kernel_build = $expectedKernel
     }
     boot          = [ordered]@{
       reason_raw   = $reason
@@ -779,14 +1282,14 @@ function Show-PanicGuide {
   }
   SayOk "诊断日志已就绪: $ZipPath"
   Say "请将该 zip 文件 (连同上方诊断摘要) 发送给维护者/Agent 分析。"
-  Say "分析提示: 01_boot_info.txt 看机型/内核; 02_pstore/ 尾部看 panic 调用栈; 06_local_tmp/glt_seq_*.txt 最后一条记录定位 panic 前动作。"
+  Say "优先阅读 zip 内 00_SUMMARY.txt (AI 速读摘要); 01_boot_info 看机型/内核; 02_pstore/ 看 panic 栈; 06_local_tmp/glt_seq_*.txt 看最后动作。"
 }
 
 # ============================================================
 # MAIN
 # ============================================================
 Say "=============================================="
-Say " GhostLock-X200 一键 Root (v1.1.0)"
+Say " GhostLock-X200 一键 Root (v1.3.0)"
 Say "=============================================="
 
 # 0. 依赖自检 (adb + python 依赖; -SkipDeps 跳过自动下载)
@@ -809,24 +1312,55 @@ if (-not $serial) {
 }
 SayOk "设备: $serial"
 
-# 3. build 检测
+# 3. build 检测 + 机型模块自动匹配 (v1.4)
 $ver = (& $adb -s $serial shell cat /proc/version 2>$null | Out-String).Trim()
 Say "内核版本: $($ver.Split([Environment]::NewLine)[0])"
-$buildMatch = $ver -match $EXPECTED_KERNEL
+$modMatch = Match-DeviceModule $ver
 
 if ($Force) {
-  SayWarn "-Force: 跳过 build 检测, 强制使用随包 b57 偏移直接运行 (非 b57 build 有 panic 风险, 风险自担!)"
-} elseif ($buildMatch) {
-  SayOk "内核与随包偏移匹配 (b57), 直接运行主链"
+  SayWarn "-Force: 跳过机型匹配, 强制使用 $ProfilePath 直接运行 (偏移不匹配有 panic 风险, 风险自担!)"
+} elseif ($modMatch -and $modMatch.level -eq "exact") {
+  $ProfilePath = $modMatch.path
+  $ProfileInfo = $modMatch.device
+  SayOk ("机型模块命中 (exact): " + $ProfileInfo.device + " -> " + $ProfilePath)
+  $mo = Join-Path (Split-Path $ProfilePath) "win_offs.json"
+  if (Test-Path -LiteralPath $mo) {
+    $GEN_WIN_OFFS = $mo
+    SayOk "使用模块偏移: $GEN_WIN_OFFS"
+  } else {
+    SayWarn "模块命中但缺 win_offs.json, 需从素材重建偏移"
+    $work = Join-Path $env:TEMP "ghostlock_offsets"
+    New-Item -ItemType Directory -Force -Path $work | Out-Null
+    $asset = Choose-Asset
+    $rebuild = Invoke-DeviceBuild -Asset $asset -WorkDir $work
+    if ($null -eq $rebuild) { SayErr "机型模块生成失败"; exit 1 }
+    if ($rebuild -eq "cancelled") { SayErr "已取消"; exit 1 }
+  }
 } else {
-  SayWarn "内核与随包 b57 偏移不匹配或无法确认。需要重新生成偏移。"
+  if ($modMatch) {
+    SayWarn ("同族模块命中 (family): " + $modMatch.device.device + " 未精确匹配, 需重新生成偏移")
+  } else {
+    SayWarn "未匹配到机型模块, 将自动提取并生成新机型模块 (可分享)。"
+  }
   Say "本工具可自动从 全量包 zip / payload.bin / boot.img / kernel.raw / kernel.elf 重建 win_offs。"
   $work = Join-Path $env:TEMP "ghostlock_offsets"
   New-Item -ItemType Directory -Force -Path $work | Out-Null
   $asset = Choose-Asset
-  $wo = Build-WinOffsFromAsset $asset $work
-  if (-not $wo) { SayErr "偏移生成失败, 请按提示补齐工具或素材后重试"; exit 1 }
-  $GEN_WIN_OFFS = $wo
+
+  # 1. 机型可行性预检 (先摆上台面: 避免在 MTK 未知族 / init_boot 误选上空耗)
+  $oa = Join-Path $pkgRoot "tools\offset_tools\offsets_auto.py"
+  $feasOut = (& $python $oa feasibility $asset --profile $ProfilePath 2>&1 | Out-String)
+  Log-Raw ("[feasibility]`n" + $feasOut)
+  @($feasOut -split "`r?`n") | ForEach-Object { if ($_.Trim()) { Say $_ } }
+  if ($feasOut -match "预检结论: 不推荐") {
+    $resp = Read-Host "预检结论: 不推荐 (原因见上方)。是否仍要继续? (y/N)"
+    if ($resp -notmatch '^[yY]') { SayErr "已取消, 未生成偏移"; exit 1 }
+  }
+
+  # 2. 新机型偏移重建 (v1.6: package 主导 + KMI 自动 + prebuilt 门禁, 无需 vmlinux-to-elf)
+  $rebuild = Invoke-DeviceBuild -Asset $asset -WorkDir $work
+  if ($null -eq $rebuild) { SayErr "机型模块生成失败, 请检查素材/依赖后重试"; exit 1 }
+  if ($rebuild -eq "cancelled") { SayErr "已取消"; exit 1 }
   SayOk "将使用新偏移: $GEN_WIN_OFFS"
 }
 
@@ -838,8 +1372,13 @@ $main = Join-Path $pkgRoot "tools\scripts\root_full_permissive_restore.ps1"
 $argsMain = @("-File", $main)
 if ($AdbPath) { $argsMain += @("-AdbPath", $AdbPath) }
 if ($Serial)  { $argsMain += @("-Serial", $Serial) }
-if ($KsuKoPath) { $argsMain += @("-KsuKoPath", $KsuKoPath) }
+if ($KO_ADAPTED) { $argsMain += @("-KsuKoPath", $KO_ADAPTED) }
+elseif ($KsuKoPath) { $argsMain += @("-KsuKoPath", $KsuKoPath) }
+if ($PR_ADAPTED) { $argsMain += @("-PermRestorePath", $PR_ADAPTED) }
+if ($ModuleW2) { $argsMain += @("-W2HostPath", $ModuleW2) }
+if ($ModuleGlt) { $argsMain += @("-GltPath", $ModuleGlt) }
 if ($GEN_WIN_OFFS) { $argsMain += @("-WinOffsPath", $GEN_WIN_OFFS) }
+if ($ProfilePath) { $argsMain += @("-ProfilePath", $ProfilePath) }
 if ($SkipPermissiveRestore) { $argsMain += "-SkipPermissiveRestore" }
 
 Say "=============================================="
@@ -854,6 +1393,19 @@ $mainOutput = ""
 if ($mainOutTee) {
   $mainOutput = (($mainOutTee | Out-String) -replace "`r?`n$", "")
   Log-Raw ("[主链输出]`n" + $mainOutput)
+}
+
+# 5.0 主链成功后: 自动尝试获取 P0 物理常量 (detect-p0, 需设备临时 su; 失败静默)
+if ($rc -eq 0) {
+  Say "主链成功。尝试自动获取 P0 物理常量 (detect-p0, 需设备临时 su; 失败不影响) ..."
+  $p0Log = (& $python $oa detect-p0 2>&1 | Out-String)
+  Log-Raw ("[detect-p0]`n" + $p0Log)
+  if ($p0Log -match "p0_phys_offset") {
+    @($p0Log -split "`r?`n" | Where-Object { $_.Trim() }) | ForEach-Object { Say $_ }
+    Say "如需固化到模块: python tools\offset_tools\offsets_auto.py detect-p0 --write-profile `"$ProfilePath`""
+  } else {
+    SayWarn "detect-p0 未成功 (需要设备可 su 且 /proc/iomem 未隐藏)"
+  }
 }
 
 # 5. 失败路径: 自动采集诊断日志 (默认开启; -NoPanicDiag 关闭)
@@ -891,11 +1443,14 @@ if ($rc -ne 0 -and -not $NoPanicDiag) {
     Copy-Item -LiteralPath $LOG_FILE (Join-Path $diagDir "97_root_console.log") -Force
     $manifest.files += @{ name = "97_root_console.log"; size = (Get-Item (Join-Path $diagDir "97_root_console.log")).Length; note = "root.ps1 自身运行日志" }
   }
-  # 98/97 已追加 -> 重写索引, 保持 manifest 与 zip 内容一致 (AI 可读性)
+  # AI 速读摘要 (00_SUMMARY.txt) + 98/97 已追加 -> 重写索引, 保持 manifest 与 zip 一致
+  $summary = Build-DiagSummary $manifest $diagDir $mainOutput
+  $summary | Out-File -FilePath (Join-Path $diagDir "00_SUMMARY.txt") -Encoding utf8
+  $manifest.files += @{ name = "00_SUMMARY.txt"; size = (Get-Item (Join-Path $diagDir "00_SUMMARY.txt")).Length; note = "AI 速读摘要 (优先阅读/可直接粘贴给 Agent)" }
   $manifest | ConvertTo-Json -Depth 6 | Out-File -FilePath (Join-Path $diagDir "00_manifest.json") -Encoding utf8
-  "附加: 98_main_chain.log / 97_root_console.log (host 侧完整日志, 定位失败阶段)" | Out-File -FilePath (Join-Path $diagDir "00_manifest.txt") -Encoding utf8 -Append
+  "附加: 00_SUMMARY.txt (AI 速读摘要) / 98_main_chain.log / 97_root_console.log (host 侧完整日志)" | Out-File -FilePath (Join-Path $diagDir "00_manifest.txt") -Encoding utf8 -Append
 
-  $zip = Join-Path (Get-Location).Path ("ghostlock_diag_" + $ts + ".zip")
+  $zip = Join-Path $pkgRoot ("log\ghostlock_diag_" + $ts + ".zip")
   try {
     Compress-Archive -Path (Join-Path $diagDir "*") -DestinationPath $zip -Force
   } catch {
@@ -910,4 +1465,5 @@ if ($rc -ne 0 -and -not $NoPanicDiag) {
 } elseif ($rc -ne 0) {
   SayErr "-NoPanicDiag: 未采集诊断; 如需分析请发送运行日志: $LOG_FILE"
 }
+if ($LOG_FILE -and (Test-Path -LiteralPath $LOG_FILE)) { SayOk "运行日志已保存: $LOG_FILE" }
 exit $rc

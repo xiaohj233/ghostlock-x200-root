@@ -1,0 +1,20 @@
+{
+  "module": "x200_b57",
+  "device": "vivo X200 (PD2415)",
+  "kernel_release": "6.6.89-android15-8-gb57af212129c-abogki457297774-4k",
+  "created": "2026-08-11T00:00:00+08:00",
+  "verified": true,
+  "source": "builtin",
+  "files": {
+    "device.json": "fdac1435b7d692a85d1594b0d8d9212faf23f8faf9466aa01ad38ccd66b300bb",
+    "win_offs.json": "0d7770f11f2bed710b2d2b5993160ca6c6fda0932c35bb15e3da4261e13daedc",
+    "offsets.json": "1ff19c96b2088fe98a95531a5d5cca004d6359d2b7a67bb92f82e98c8a7e891b",
+    "target.h": "62206aa586f8c7aa679a4ca5cb57d47630a71c72832af7260f64abd48419c0ae",
+    "pselect.json": "810a26dad17f30dc99f8e9e703231b4343bf63f87caf692383a452a8b4bd0fac"
+  },
+  "files_optional": [
+    "offsets.json",
+    "target.h",
+    "pselect.json"
+  ]
+}

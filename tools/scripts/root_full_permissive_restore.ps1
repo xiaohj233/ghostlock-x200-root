@@ -5,7 +5,11 @@ param(
   [string]$Serial,    # override device serial
   [string]$WorkDir,   # override package root (default: parent of this script)
   [string]$KsuKoPath, # override kernelsu.ko (default: in-tree modules/kernelsu/kernelsu.ko)
+  [string]$PermRestorePath, # override permissive_restore.ko (default: in-tree modules/permissive_restore/permissive_restore.ko)
   [string]$WinOffsPath, # override win_offs json (default: tools/offset_tools/win_offs_b57.json)
+  [string]$W2HostPath, # override w2host binary (default: prebuilt/w2host; 机型模块可带)
+  [string]$GltPath,    # override glt binary (default: prebuilt/glt_esync; 机型模块可带)
+  [string]$ProfilePath, # override 机型模块 device.json (live 元数据用; 可选)
   [switch]$SkipPermissiveRestore # do NOT load permissive_restore.ko; keep enforcing (network may break)
 )
 $ErrorActionPreference = 'SilentlyContinue'
@@ -71,10 +75,13 @@ $KO_OFFICIAL  = $KsuKoPath
 if (-not $KO_OFFICIAL) { $KO_OFFICIAL = $env:KSU_KO_PATH }
 if (-not $KO_OFFICIAL) { $KO_OFFICIAL = Resolve-Asset "modules\kernelsu\kernelsu.ko" }
 $PERM_RESTORE_SRC   = $null
-if (-not $SkipPermissiveRestore) { $PERM_RESTORE_SRC = Resolve-Asset "modules\permissive_restore\permissive_restore.ko" }
+$PERM_RESTORE_SRC   = $PermRestorePath
+if (-not $PERM_RESTORE_SRC -and -not $SkipPermissiveRestore) { $PERM_RESTORE_SRC = Resolve-Asset "modules\permissive_restore\permissive_restore.ko" }
 $KSUD         = Resolve-Asset "prebuilt\ksud"
-$GLT          = Resolve-Asset "prebuilt\glt_esync"
-$W2HOST       = Resolve-Asset "prebuilt\w2host"
+$GLT          = $GltPath
+if (-not $GLT) { $GLT = Resolve-Asset "prebuilt\glt_esync" }
+$W2HOST       = $W2HostPath
+if (-not $W2HOST) { $W2HOST = Resolve-Asset "prebuilt\w2host" }
 $PATCH_ALL    = Resolve-Asset "tools\offset_tools\patch_ko_all.py"
 $OFFSETS_AUTO = Resolve-Asset "tools\offset_tools\offsets_auto.py"
 $WIN_OFFS     = $WinOffsPath
@@ -153,7 +160,9 @@ function Get-GLLock {
 
 # ---- 诊断标记: 每阶段落一条记录 (写入 /data/local/tmp, 只读无关紧要; 异常重启后由 host 拉取) ----
 function Mark([string]$s) {
-  Shell ("echo '" + $s + " host=" + (Get-Date -Format "HH:mm:ss") + "' >> $dev_seq")
+  # 必须吞掉输出: 裸调用时返回的空字符串会泄漏进外层函数输出流,
+  # 曾导致 $gl5 = Get-GLLock 拿到 ("", "0x...") 数组 -> GL_LOCK= 0x... -> glt 未启动
+  Shell ("echo '" + $s + " host=" + (Get-Date -Format "HH:mm:ss") + "' >> $dev_seq") | Out-Null
 }
 
 Write-Output "=== root_full_permissive_restore: permissive -> kptr(leaf-RED) -> CAPSROOT -> INSMOD permissive_restore+kernelsu -> 25s permissive ==="
@@ -233,7 +242,9 @@ Write-Output "STAGE3.5a: kallsyms dumped ($sz bytes)"
 # ---- STAGE3.4: 全自动偏移提取 (kallsyms + BTF + 离线反汇编窗口) ----
 Adb "pull /sys/kernel/btf/vmlinux $BTF_LOCAL" | Out-Null
 if (-not (Test-Path $BTF_LOCAL)) { Write-Output "STAGE3.4 FAIL: btf pull"; exit 1 }
-& $python $OFFSETS_AUTO $KSYM_OUT $BTF_LOCAL $WIN_OFFS $OFFS_JSON 2>&1 | Select-Object -Last 4 | ForEach-Object { Write-Output "offsets: $_" }
+$liveArgs = @("live", $KSYM_OUT, $BTF_LOCAL, $WIN_OFFS, $OFFS_JSON)
+if ($ProfilePath) { $liveArgs += @("--profile", $ProfilePath) }
+& $python $OFFSETS_AUTO @liveArgs 2>&1 | Select-Object -Last 4 | ForEach-Object { Write-Output "offsets: $_" }
 if (-not (Test-Path $OFFS_JSON)) { Write-Output "STAGE3.4 FAIL: offsets.json"; exit 1 }
 $off = Get-Content $OFFS_JSON -Raw | ConvertFrom-Json
 if (-not $off.selinux_enforcing_p0 -or -not $off.kptr_restrict_p0 -or -not $off.capsym_va) { Write-Output "STAGE3.4 FAIL: offsets incomplete"; exit 1 }
@@ -288,7 +299,8 @@ Mark "STAGE3.5 OK"
 #   修复: 杀进程与启动拆成两条独立 Shell 调用 (kill 命令只含 [t] 字面).
 # ---- 诊断标记: 记录 panic 前的最后动作 (写入 /data/local/tmp, 异常重启后仍存在) ----
 $bid0 = (Shell "cat /proc/sys/kernel/random/boot_id 2>/dev/null").Trim()
-Shell ("echo 'STAGE4/5 start: host=" + (Get-Date -Format "HH:mm:ss") + " boot_id=$bid0' > $dev_seq")
+# 注意: 必须用 >> 追加 (文件由第一个 Mark 创建, 用 > 会清掉 STAGE1-3.5 的阶段标记)
+Shell ("echo 'STAGE4/5 start: host=" + (Get-Date -Format "HH:mm:ss") + " boot_id=$bid0' >> $dev_seq")
 $cred = ''
 for ($rr=1; $rr -le 3 -and -not $cred; $rr++) {
   Write-Output "STAGE4/5 ROUND $rr"

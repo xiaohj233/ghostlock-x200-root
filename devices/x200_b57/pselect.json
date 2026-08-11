@@ -1,0 +1,28 @@
+{
+  "psselect_waiter_word_shift": 0,
+  "pselect_map_ww_ctx": 1,
+  "waiter_local_off": 144,
+  "pselect_word0_relative": -512,
+  "futex_waiter_relative": -512,
+  "pselect_buffer_off": 128,
+  "pselect_route_nfds": 264,
+  "fds_bytes": 40,
+  "pselect_chain": [
+    "pselect_wrapper",
+    "pselect_core"
+  ],
+  "futex_chain": [
+    "futex_wrapper",
+    "futex_dispatch",
+    "futex_wait"
+  ],
+  "pi_tree_off": 40,
+  "frames": {
+    "pselect_wrapper": 144,
+    "pselect_core": 496,
+    "futex_wrapper": 112,
+    "futex_wait": 448,
+    "futex_dispatch": 96
+  },
+  "status": "ok"
+}

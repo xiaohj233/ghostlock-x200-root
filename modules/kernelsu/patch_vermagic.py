@@ -29,22 +29,29 @@ Usage:
   # download the official asset:
   curl -L -o android15-6.6_kernelsu.ko \
     https://github.com/tiann/KernelSU/releases/download/v3.2.5/android15-6.6_kernelsu.ko
-  # adapt for the device:
+  # adapt for the device (默认 b57 release):
   python patch_vermagic.py android15-6.6_kernelsu.ko kernelsu.ko
-  # output SHA256 must equal 187BB1BD...
+  # 指定目标内核 release (完整 UTS_RELEASE, 取设备 /proc/version 第 3 字段):
+  python patch_vermagic.py src.ko dst.ko \
+    --release 6.6.89-android15-8-gb57af212129c-abogki457297774-4k
+  # 输入不是官方 v3.2.5 资产时 (如自编译 ko / 已 patch 过的 ko):
+  python patch_vermagic.py modules/kernelsu/kernelsu.ko out.ko --no-sha-check
+  # 幂等: 输入已是目标 vermagic 时直接成功, 不报错.
+  # 注意: 只改 vermagic 字符串, 不保证 ABI; modversions CRC 仍按编译时内核,
+  #   非同构建内核 insmod 可能报 Unknown symbol/version (需重新编译).
 """
 
 import hashlib
+import os
+import shutil
 import struct
 import sys
 
+DEFAULT_RELEASE = "6.6.89-android15-8-gb57af212129c-abogki457297774-4k"
 OLD_VERMAGIC = (
     b"6.6.127-4k-g46a034eca005-dirty SMP preempt mod_unload modversions aarch64"
 )
-NEW_VERMAGIC = (
-    b"6.6.89-android15-8-gb57af212129c-abogki457297774-4k "
-    b"SMP preempt mod_unload modversions aarch64"
-)
+MODULE_FLAGS = " SMP preempt mod_unload modversions aarch64"
 INPUT_SHA256 = "5933ECA4EC82DACFF4209745DD7228CF95352AEF7423BA7434F8542BC848AA8C"
 EXPECTED_SHA256 = "187BB1BD4732DD1E193C09E1BA35A5D3A2B35190B32AABF3F2F7B0CDB03A71FB"
 
@@ -71,28 +78,64 @@ def find_modinfo(data):
     raise RuntimeError(".modinfo section not found")
 
 
+def read_vermagic(data, mi_off, mi_size):
+    """返回当前 vermagic 字节 (不含 'vermagic=' 前缀)."""
+    mi = bytes(data[mi_off : mi_off + mi_size])
+    pos = mi.find(b"vermagic=")
+    if pos < 0:
+        return None, None
+    end = mi.find(b"\x00", pos)
+    if end < 0:
+        end = mi_size
+    return mi[pos + 9 : end], mi_size - (pos + 9)
+
+
 def main():
-    if len(sys.argv) != 3:
+    if len(sys.argv) < 3:
         print(__doc__)
         sys.exit(2)
     src, dst = sys.argv[1], sys.argv[2]
+    release = DEFAULT_RELEASE
+    no_sha = False
+    rest = sys.argv[3:]
+    if "--release" in rest:
+        release = rest[rest.index("--release") + 1]
+    if "--no-sha-check" in rest:
+        no_sha = True
+    if not release:
+        raise RuntimeError("--release 不能为空")
+    new_vermagic = (release + MODULE_FLAGS).encode()
 
     data = bytearray(open(src, "rb").read())
     h = hashlib.sha256(bytes(data)).hexdigest().upper()
-    if h != INPUT_SHA256:
+    if not no_sha and h != INPUT_SHA256:
         print("WARNING: input SHA256 is %s (expected %s)" % (h, INPUT_SHA256))
         print("This is not the official v3.2.5 android15-6.6 asset; aborting.")
+        print("(自编译/已适配的 ko 请加 --no-sha-check)")
         sys.exit(1)
 
     mi_off, mi_size = find_modinfo(data)
-    mi = bytes(data[mi_off : mi_off + mi_size])
-    pos = mi.find(b"vermagic=" + OLD_VERMAGIC)
-    if pos < 0:
-        raise RuntimeError("old vermagic not found; input already patched?")
-    end = mi_off + pos + 9 + len(NEW_VERMAGIC)
-    assert end < mi_off + mi_size, "vermagic rewrite would overflow .modinfo"
-    data[mi_off + pos + 9 : mi_off + pos + 9 + len(NEW_VERMAGIC)] = NEW_VERMAGIC
-    data[mi_off + pos + 9 + len(NEW_VERMAGIC)] = 0  # '\0' terminator
+    cur, space = read_vermagic(data, mi_off, mi_size)
+    if cur is None:
+        raise RuntimeError(".modinfo 中未找到 vermagic=")
+    if cur == new_vermagic:
+        print("OK: 输入已是目标 vermagic, 无需修改 (幂等)")
+        if os.path.abspath(src) != os.path.abspath(dst):
+            shutil.copyfile(src, dst)
+            print("已复制:", dst)
+        print("VERIFY:", (b"vermagic=" + cur).decode(errors="replace"))
+        return 0
+
+    # 覆盖式改写: 新 vermagic 不得越出 .modinfo 段
+    if len(new_vermagic) > space:
+        raise RuntimeError(
+            "新 vermagic 长度 %d > 现有空间 %d; 该 ko 不宜直接改写, 需用官方资产重新 patch"
+            % (len(new_vermagic), space))
+    # 定位实际写入起点 (read_vermagic 已知 vermagic= 起始)
+    mi2 = bytes(data[mi_off : mi_off + mi_size])
+    pos = mi2.find(b"vermagic=")
+    data[mi_off + pos + 9 : mi_off + pos + 9 + len(new_vermagic)] = new_vermagic
+    data[mi_off + pos + 9 + len(new_vermagic)] = 0  # '\0' terminator
     open(dst, "wb").write(bytes(data))
 
     out = open(dst, "rb").read()

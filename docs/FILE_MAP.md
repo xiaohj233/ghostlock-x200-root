@@ -1,4 +1,4 @@
-# FILE_MAP — GhostLock-X200 v1.0 file-by-file map
+# FILE_MAP — GhostLock-X200 v1.3.0 file-by-file map
 
 > Path → purpose → origin → license. README explains *how to use*; this file
 > explains *what every file is*. Provenance terms: COPIED (verbatim upstream),
@@ -9,6 +9,9 @@
 | Path | Purpose | Origin | License |
 |---|---|---|---|
 | `README.md` | user-facing README (Chinese: overview + comparisons; details in docs/USAGE.zh-CN.md) | LOCAL | Apache-2.0 |
+| `run_root.bat` | the single double-click entry: runs root.ps1, keeps window open (errors stay visible) | LOCAL | Apache-2.0 |
+| `log/` | runtime log `ghostlock_root_<timestamp>.log` + panic diag bundle `ghostlock_diag_<timestamp>.zip` (auto-generated, not tracked) | LOCAL | Apache-2.0 |
+| `release_notes_v1.3.0.md` | release changelog for v1.3.0 | LOCAL | Apache-2.0 |
 | `docs/ARCHITECTURE.md` | architecture / STAGE flow / component map | LOCAL | Apache-2.0 |
 | `docs/FILE_MAP.md` | this file | LOCAL | Apache-2.0 |
 | `docs/USAGE.zh-CN.md` | detailed usage guide (Chinese): quick start, dependencies, params, FAQ | LOCAL | Apache-2.0 |
@@ -85,6 +88,7 @@
 | `root_full_permissive_restore.ps1` | **main chain** STAGE1-7; `-WinOffsPath` / `-SkipPermissiveRestore` supported |
 | `root_full_official.ps1` | legacy control chain (KSU only, enforcing stays) |
 | `restart_w2.sh` | device-side helper (restart W2 host on target) |
+| `find_adb.ps1` | smart adb locator (multi-location probing + `adb version` validation; shared by root.ps1 & main chain) |
 
 ### tools/offset_tools/ — offset toolchain
 

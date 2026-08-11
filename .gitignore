@@ -22,8 +22,14 @@ prebuilt/
 # root.ps1 依赖下载到项目根目录 (-DepsInPackage / -DepsDir <包根>)
 /platform-tools/
 /payload-dumper-go/
+/extracted_*/
 /platform-tools-latest-windows.zip
 /payload-dumper-go_windows_amd64.tar.gz
+/payload-dumper-go_1.3.0_windows_amd64.tar.gz
+# release 资产 (gh release 上传, 不进 git)
+/ghostlock-x200-root-v*.zip
+# 运行日志 / 异常重启诊断包
+/log/
 # python
 __pycache__/
 *.pyc

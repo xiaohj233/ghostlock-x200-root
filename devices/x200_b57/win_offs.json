@@ -1,0 +1,34 @@
+{
+  "physmap_base": "0xffffff8000000000",
+  "device": "vivo X200 (PD2415)",
+  "kernel_release": "6.6.89-android15-8-gb57af212129c-abogki457297774-4k",
+  "family": "b57",
+  "soc": "dimensity",
+  "elf": "D:\\Code\\Root\\boot_out\\b57.elf",
+  "kimage_text_base": "0xffffffc080000000",
+  "sym_offs": {
+    "selinux_state": "0x2346ee8",
+    "kptr_restrict": "0x210bd20",
+    "init_cred": "0x21205c8",
+    "init_user_ns": "0x211edd0",
+    "zeroes_buf": "0x2342820",
+    "commit_creds": "0xe2f4c",
+    "prepare_kernel_cred": "0xe3458",
+    "__arm64_sys_getuid": "0xcc5a4",
+    "__arm64_sys_geteuid": "0xcc5c8",
+    "__arm64_sys_getresuid": "0xcbc04"
+  },
+  "w2host": {
+    "cred_ip_offs": [
+      "0xcbc0c",
+      "0xcbc10",
+      "0xcbc14",
+      "0xcbc18",
+      "0xcbc1c",
+      "0xcc5b0",
+      "0xcc5d4"
+    ],
+    "win_lo": "0xcba0c",
+    "win_hi": "0xcc7d4"
+  }
+}

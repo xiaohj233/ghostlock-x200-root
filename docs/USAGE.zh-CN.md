@@ -57,6 +57,8 @@ adb shell cat /proc/version
 - 需要时透传 `-SkipPermissiveRestore` 与 `-KsuKoPath`。
 
 ```powershell
+# 唯一入口：双击 run_root.bat（结束后窗口停留，报错不闪没）
+
 # 最简单：全自动（仅当需要重建偏移时才弹文件对话框）
 powershell -ExecutionPolicy Bypass -File root.ps1
 
@@ -68,12 +70,22 @@ powershell -ExecutionPolicy Bypass -File root.ps1 -SkipPermissiveRestore
 
 # 直接指定固件素材（不弹对话框）
 powershell -ExecutionPolicy Bypass -File root.ps1 -AssetPath C:\path\to\boot.img
+
+# 关闭自动日志 / 指定日志路径 / 关闭异常重启诊断
+powershell -ExecutionPolicy Bypass -File root.ps1 -NoLog
+powershell -ExecutionPolicy Bypass -File root.ps1 -LogPath D:\logs\ghostlock.log
+powershell -ExecutionPolicy Bypass -File root.ps1 -NoPanicDiag
 ```
+
+> **运行日志**：默认自动写入包内 `log\ghostlock_root_<时间戳>.log`（启动与结束
+> 时控制台都会打印完整路径），包含全部步骤与子进程原始输出；log 目录不可写时
+> 自动回退 `%TEMP%`。`-NoLog` 关闭，`-LogPath` 自定义路径。
 
 ### 依赖自动安装
 
-`root.ps1` 会先检查所有必需的宿主机工具，**仅自动下载缺失项**
-（写入 `%LOCALAPPDATA%\GhostLock-X200\deps`，绝不写入仓库）：
+`root.ps1` 会先检查所有必需的宿主机工具，**仅自动下载缺失项**（默认写入
+**项目根目录** `platform-tools/`、`payload-dumper-go/` 等，包内自包含；
+项目根不可写时自动回退 `%LOCALAPPDATA%\GhostLock-X200\deps`）：
 
 | 依赖 | 本机查找（按顺序） | 自动安装回退 |
 |---|---|---|
@@ -81,12 +93,35 @@ powershell -ExecutionPolicy Bypass -File root.ps1 -AssetPath C:\path\to\boot.img
 | Python | `-Python`、PATH（`python`/`py`/`python3`）、常见安装目录、WindowsApps | `winget install Python.Python.3` |
 | Python 依赖包 | `import capstone, elftools` 探测 | `pip install -r tools\offset_tools\requirements.txt` |
 | payload 提取工具 | PATH（`payload-dumper-go`）、仓库根 `payload_dumper.py`、WSL | GitHub release 的 `payload-dumper-go` 1.3.0 |
-| vmlinux-to-elf | PATH、Python 模块、WSL | `pip install vmlinux-to-elf`，失败回退 WSL pip（Windows 上 minilzo 可能需要 MSVC） |
+| vmlinux-to-elf | PATH、Python 模块、WSL（**仅 derive-pselect 可选使用**） | `pip install vmlinux-to-elf`，失败回退 WSL pip；v1.5+ 的 win_offs 已改为 Image 直反汇编（`winoffs-image`），不再依赖此工具 |
 
 - `-SkipDeps` 关闭全部自动下载（离线 / 审查场景），仅打印手动安装指引。
-- `-DepsDir <path>` 覆盖依赖下载目录。
+- `-DepsDir <path>` 覆盖依赖下载目录；`-DepsInPackage` 为 v1.1.0 起默认行为
+  （依赖下载到项目根目录），保留兼容。
 - 所有下载来自官方 / 上游源（Google、GitHub release、PyPI）；仓库内不捆绑任何
   第三方二进制。下载仅需联网一次，之后从 deps 目录复用。
+
+### 异常重启诊断（自动）
+
+- 主链失败后自动判断设备是否异常重启（panic / watchdog，可恢复、无变砖风险前提）。
+- 若确认异常重启（或设备长时间未恢复），自动采集诊断日志并打包
+  `log\ghostlock_diag_<时间戳>.zip`：含机型/内核/启动原因、pstore（panic 瞬间
+  内核日志）、MTK AEE 清单、每阶段运行标记、root 级日志快照（到达 root 阶段
+  自动 dump dmesg/内核 logcat/模块/selinux）、host 完整运行日志。
+- zip 内为 **AI 可读格式**（00_manifest.json 索引 + 99_READ_ME.txt 阅读指南），
+  运行结束会给出指引：将该 zip 发送给维护者/Agent 分析，或自行用于二次开发调试。
+- 大文件自动降体积：dmesg / pstore / root 快照均压缩为「尾部 + 关键行」摘要
+  （L<行号> 对应原文行、连续重复折叠为 (xN)），panic 栈与关键错误完整保留。
+- 采集全程只读、仅在主链退出后执行、不读写流式节点，**不会引发 panic**；
+  `-NoPanicDiag` 可关闭。
+
+### vmlinux-to-elf 不再是 win_offs 依赖（v1.5+）
+
+偏移生成（winoffs）已改为 capstone 直接反汇编内核 Image（`winoffs-image`，
+符号用离线 kallsyms，boot.img 自动提取内核段 + 解压），**无需 vmlinux-to-elf**。
+vmlinux-to-elf 仅在 `derive-pselect`（pselect 栈布局推导）时可选使用：Windows
+装不上（minilzo 需 MSVC）会自动回退 WSL kali-linux；两者都不可用时跳过
+pselect 推导，使用默认值 0（b57 已验证）。本工具支持直接以 `kernel.elf` 为素材。
 
 ### 手动脚本
 
@@ -255,9 +290,9 @@ A: KernelSU 的 su 在某些场景可能触发 vivo 检测 panic；rootcmd 是�
 root 通道，不经过 su，也就不会触发这类检测。
 
 ### Q: 断网/离线能用吗？
-A: 能。依赖自动下载只需联网一次，之后从 `%LOCALAPPDATA%\GhostLock-X200\deps`
-复用；`-SkipDeps` 可关闭自动下载（离线/审查场景）。设备端网络在 STAGE7
-permissive 恢复后正常（实测网络可用）。
+A: 能。依赖自动下载只需联网一次，之后从项目根目录（或回退的
+`%LOCALAPPDATA%\GhostLock-X200\deps`）复用；`-SkipDeps` 可关闭自动下载
+（离线/审查场景）。设备端网络在 STAGE7 permissive 恢复后正常（实测网络可用）。
 
 ### Q: 升级系统后还能用吗？
 A: 不一定。内核 >= 6.6.140 已修复 CVE-2026-43499，无法使用。升级前先
@@ -277,4 +312,6 @@ A: 不会主动清空。但异常重启（如 sysrq 强制重启）可能损坏 
 A: 核心条件是 vivo X200 (PD2415) + 内核 `6.6.89-android15-8-gb57af212129c`
 构建（< 6.6.140，漏洞未修复）。除已实测的 16.1.12.2.W10 外，其他机型/构建
 均未实测，可尝试自行适配（同内核的 iQOO Neo11 等需重新生成偏移，其他
-SoC/内核需完整重新开发）。详见上文“支持的设备与版本”。
+SoC/内核需完整重新开发）。非官方支持列表机型**允许强行尝试**：偏移自动重建、
+异常重启自动出诊断包，最终可用性取决于二次开发适配（模块 vermagic 需按目标
+内核重新编译），不保证直接可用。详见上文“支持的设备与版本”。

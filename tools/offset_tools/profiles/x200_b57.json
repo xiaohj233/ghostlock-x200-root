@@ -1,0 +1,21 @@
+{
+  "device": "vivo X200 (PD2415)",
+  "kernel_release": "6.6.89-android15-8-gb57af212129c-abogki457297774-4k",
+  "family": "b57",
+  "soc": "dimensity",
+  "variant": "x200_release",
+  "fingerprint": "vivo/PD2415/PD2415:16/BP2A.250605.031.A3_V000L1/compiler260430161853:user/release-keys",
+  "kimage_text_base": "0xffffffc080000000",
+  "p0_page_offset": "0xffffff8000000000",
+  "p0_phys_offset": "0x80000000",
+  "p0_kernel_phys_load": "0x80000000",
+  "identity_start": "0xffffff8000000000",
+  "identity_end": "0xffffff9000000000",
+  "direct_map_base": "0xffffff8000000000",
+  "direct_map_end": "0xffffff9000000000",
+  "vmemmap_start": "0xfffffffe00000000",
+  "physmap_base": "0xffffff8000000000",
+  "task_cred_off": "0x820",
+  "verified": true,
+  "notes": "真机已验证 (X200 PD2415 16.1.12.2.W10)。值来源: exploit/src/target_x200.h + tools/offset_tools/win_offs_b57.json。"
+}

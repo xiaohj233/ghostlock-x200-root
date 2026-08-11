@@ -2,7 +2,7 @@
 SPDX-FileCopyrightText: 2026 GhostLock-X200 contributors
 SPDX-License-Identifier: Apache-2.0
 -->
-# FILE_MAP — GhostLock-X200 v1.0 逐文件映射（中文版）
+# FILE_MAP — GhostLock-X200 v1.3.0 逐文件映射（中文版）
 
 > 路径 → 用途 → 来源 → 许可证。README 说明*怎么用*；本文件说明*每个文件是什么*。来源术语：COPIED（上游逐字）、DERIVED（自上游修改）、LOCAL（项目原创）。
 
@@ -11,6 +11,9 @@ SPDX-License-Identifier: Apache-2.0
 | 路径 | 用途 | 来源 | 许可证 |
 |---|---|---|---|
 | `README.md` | 用户文档（中文：概述 + 项目对比；详细用法见 docs/USAGE.zh-CN.md） | LOCAL | Apache-2.0 |
+| `run_root.bat` | 唯一双击入口：运行 root.ps1 并保持窗口停留（报错不闪没） | LOCAL | Apache-2.0 |
+| `log/` | 运行日志 `ghostlock_root_<时间戳>.log` + 异常重启诊断包 `ghostlock_diag_<时间戳>.zip`（自动生成，不进仓库） | LOCAL | Apache-2.0 |
+| `release_notes_v1.3.0.md` | 本版 release 更新日志 | LOCAL | Apache-2.0 |
 | `docs/ARCHITECTURE.md` | 架构 / STAGE 流程 / 组件映射 | LOCAL | Apache-2.0 |
 | `docs/ARCHITECTURE.zh-CN.md` | 架构（中文版） | LOCAL | Apache-2.0 |
 | `docs/FILE_MAP.md` | 本文件 | LOCAL | Apache-2.0 |
@@ -89,6 +92,7 @@ SPDX-License-Identifier: Apache-2.0
 | `root_full_permissive_restore.ps1` | **主链** STAGE1-7；支持 `-WinOffsPath` / `-SkipPermissiveRestore` |
 | `root_full_official.ps1` | legacy 对照链（仅 KSU，保持 enforcing） |
 | `restart_w2.sh` | 设备端辅助（在目标上重启 W2 host） |
+| `find_adb.ps1` | 智能 adb 定位（多位置探测 + `adb version` 校验；root.ps1 与主链共用） |
 
 ### tools/offset_tools/ — 偏移工具链
 
