@@ -33,5 +33,6 @@ __pycache__/
 *.pyc
 # dev / backup / logs
 *.bak*
+*.old
 *.log
 *.out.txt

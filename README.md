@@ -39,47 +39,47 @@ Bootloader、不需要刷机、不会清空数据。运行后获得临时 root�
   （AI 可读格式，存于 `log\` 文件夹），按控制台指引发送给维护者/Agent 分析即可
 - **adb 智能定位**：多位置探测 + 可用性校验，找不到时自动下载到包内
 - 依赖默认下载到**项目根目录**（包内自包含，可整体拷贝），不可写时自动回退
-- **多机型 profile 参数化（v1.2）**：偏移工具按 `tools/offset_tools/profiles/<device>.json`
+- **多机型 profile 参数化**：偏移工具按 `tools/offset_tools/profiles/<device>.json`
   读取机型常量（KIMAGE_TEXT_BASE / P0_* / 直映射 / vmemmap / physmap_base /
   内核 release / SoC），不再硬编码 b57；新机型复制 `x200_b57.json` 改名填写即可
-- **机型可行性预检（v1.2）**：素材选择后自动执行预检，输出
+- **机型可行性预检**：素材选择后自动执行预检，输出
   `推荐 / 可尝试 / 不推荐` 与逐项原因——覆盖 init_boot 误选（kernel_size=0）、
   内核是否已知族、SoC、PANIC_ON_OOPS 等；**MTK 未知族明确提示不推荐**（附社区
   失败证据，避免空耗）
-- **KMI 自动重打（v1.2）**：`-KernelRelease <完整UTS_RELEASE>` 与 profile 不同时，
+- **KMI 自动重打**：`-KernelRelease <完整UTS_RELEASE>` 与 profile 不同时，
   自动改写 kernelsu.ko / permissive_restore.ko 的 vermagic 至目标内核
-- **离线恢复（v1.3）**：无需已 root 设备，仅凭 boot.img / kernel.raw / kernel.elf
+- **离线恢复**：无需已 root 设备，仅凭 boot.img / kernel.raw / kernel.elf
   即可离线恢复 kallsyms + BTF（支持 6.1 / 6.6 / 6.12 内核分支），无设备也能生成
   target header（root.ps1 素材流程自动执行）
-- **pselect 栈布局自动推导（v1.3）**：反汇编 pselect/futex 调用链自动得出
+- **pselect 栈布局自动推导**：反汇编 pselect/futex 调用链自动得出
   `PSELECT_WAITER_WORD_SHIFT`（b57 实测 = 0，与真机调参一致），不再手动固化
-- **P0 物理常量自动获取（v1.3）**：`detect-p0` 从已 root 设备的 /proc/iomem 自动
+- **P0 物理常量自动获取**：`detect-p0` 从已 root 设备的 /proc/iomem 自动
   推导 phys_offset / kernel_phys_load（含 6 项反向校验），支持文件输入与 adb 双通道
-- **机型模块化 + 可分享（v1.4）**：机型参数与偏移产物收敛为 `devices/<机型名>/`
+- **机型模块化 + 可分享**：机型参数与偏移产物收敛为 `devices/<机型名>/`
   目录（device.json + win_offs.json + offsets.json + target.h + pselect.json +
   manifest.json）；**设备在线自动匹配模块**（/proc/version 精确命中即直接用）；
   未收录机型自动提取并生成新模块（可分享）；导入他人模块解压到 `devices/` 后
   同机型自动命中；除分享模块外不再硬编码机型参数
-- **P0 物理常量自动获取（v1.5）**：`detect-p0` 新增 `--devicetree` 模式（**非 root**
+- **P0 物理常量自动获取**：`detect-p0` 新增 `--devicetree` 模式（**非 root**
   读设备 `/sys/firmware/devicetree/base/memory/reg` 自动推 phys_offset）；package 支持
   `--vendor-boot`（v3/v4 boot 的 DTB 段）离线解析 memory 节点自动填 P0；
   自动顺序 root iomem > devicetree > 素材 DTB > 待填
-- **win_offs 去 vmlinux-to-elf 依赖（v1.5）**：新增 `winoffs-image` 子命令
+- **win_offs 去 vmlinux-to-elf 依赖**：新增 `winoffs-image` 子命令
   （capstone 直接反汇编内核 Image + 离线 kallsyms，boot.img 无需转换 ELF 也能出
   w2host 偏移窗口，已验证与 b57 ELF 产物全等）
-- **exploit 编译常量参数化（v1.5）**：`PSELECT_ROUTE_NFDS` 由机型模块 target.h
+- **exploit 编译常量参数化**：`PSELECT_ROUTE_NFDS` 由机型模块 target.h
   注入（derive-pselect 推导），`main.c` 测试读地址改宏表达式；build 脚本 `-t` 按
   机型模块编译
-- **新机型流程 package 主导（v1.6）**：未收录机型素材直接走
+- **新机型流程 package 主导**：未收录机型素材直接走
   `offline → winoffs-image → pselect → header → 机型模块`，**不再依赖
   vmlinux-to-elf**（仅 derive-pselect 可选使用）；`task_cred_off` 由素材 BTF
   自动推导（不同构建的 task_struct.cred 不同，如 b57=0x820、其他构建=0x8c8），
   避免 w2host 采样窗口因偏移错误而空
-- **非 b57 prebuilt 门禁（v1.6）**：主链优先使用机型模块自带
+- **非 b57 prebuilt 门禁**：主链优先使用机型模块自带
   `devices/<id>/prebuilt/` 产物；非 b57 且模块无产物时**询问后默认不跑**
   （b57 预编译二进制硬编码偏移，强跑有 panic 风险），提示用 build 脚本 `-t`
   重编译后放入模块
-- **KMI 自动触发（v1.6）**：机型模块生成后自动读取模块 `kernel_release`，检测
+- **KMI 自动触发**：机型模块生成后自动读取模块 `kernel_release`，检测
   kernelsu.ko / permissive_restore.ko 的 vermagic 不匹配即自动重打，主链使用
   重打产物（`-KernelRelease` 保留为手动覆盖）
 - 附带 `permissive_restore` 内核模块，用于修复 KernelSU 在此设备 enforcing
@@ -105,7 +105,7 @@ Bootloader、不需要刷机、不会清空数据。运行后获得临时 root�
 > 自动从素材重建，运行中异常重启会自动打包诊断日志。最终能否 root 取决于目标
 > 机型/内核的二次开发适配（模块 vermagic 需按目标内核重新编译），不保证直接可用。
 
-> **MTK 机型可行性提示（v1.2）**：除已实测的 b57 族外，MTK（天玑/helio）未知
+> **MTK 机型可行性提示**：除已实测的 b57 族外，MTK（天玑/helio）未知
 > 内核族**不推荐投入**——社区公开记录（vivo PD2241/天玑9200）显示 KernelSnitch
 > 时序在 MTK 上不可靠（KASAN_HW_TAGS/MTE 干扰、PANIC_ON_OOPS 无试错空间、
 > vivo RSC 调度器破坏 pselect/pi 链）。运行本工具选素材时会自动预检并提示。
@@ -132,7 +132,7 @@ Bootloader、不需要刷机、不会清空数据。运行后获得临时 root�
    （`log\ghostlock_root_<时间戳>.log` / `log\ghostlock_diag_<时间戳>.zip`，
    控制台会打印完整路径）；诊断包按提示发送给维护者/Agent 分析。
 
-多机型适配（v1.2）参数：
+多机型适配参数：
 
 ```powershell
 # 使用指定机型 profile（默认 profiles/x200_b57.json）
@@ -149,7 +149,7 @@ UTS_RELEASE）、`family`（内核族标识）、`soc`（dimensity/snapdragon �
 `verified`（真机验证通过才置 true）。偏移自动从素材重建，ko vermagic 自动重打，
 但**模块 modversions ABI 仍按编译时内核**——非同构建内核 insmod 可能失败。
 
-离线生成偏移（v1.3，无需设备）：
+离线生成偏移（无需设备）：
 
 ```powershell
 # 1) 离线恢复 kallsyms + BTF (支持 boot.img / kernel.raw / kernel.elf; 6.1/6.6/6.12)
@@ -171,7 +171,7 @@ python tools\offset_tools\offsets_auto.py detect-p0 --serial <SN> --write-profil
 root.ps1 素材流程会自动串联 1-3（选素材后离线恢复 + pselect + header），主链成功后
 自动尝试 detect-p0。
 
-机型模块（v1.4）与分享：
+机型模块与分享：
 
 ```powershell
 # 查看已安装模块 / 校验模块完整性
@@ -192,7 +192,7 @@ bash exploit/build/build_w2host.sh -t my_device
 > `kernel_release` 相同即精确命中（零提取直接使用）；仅 `family` 相同视为"同族可
 > 尝试"（需重新生成偏移）。ko 不入模块，导入后按 kernel_release 自动重打 vermagic。
 
-新机型编译（v1.5 文档）：
+新机型编译：
 
 ```bash
 # 1) 生成机型模块 (boot.img 即可, 无需 vmlinux-to-elf; P0 自动或待填)

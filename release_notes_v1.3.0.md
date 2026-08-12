@@ -2,7 +2,7 @@
 
 ## 本版定位
 
-- 在 v1.1.0（X200 b57 参考实现 + 异常重启诊断）基础上，完成**多机型通用化**：
+- 在上一版（v1.1.0）基础上，完成**多机型通用化**：
   任意 vivo/iQOO（及同内核族设备）提供 boot.img / 全量包 zip / payload.bin /
   kernel.raw / kernel.elf 素材，即可**全自动**生成可分享的机型模块并尝试 root，
   无需已 root 设备、无需 vmlinux-to-elf、无需手动编译 exploit。
@@ -11,7 +11,7 @@
 
 ## 新增
 
-### 多机型通用管线（v1.2 - v1.4）
+### 多机型通用管线
 - **机型模块化 + 可分享**：`devices/<机型名>/` 自包含 device.json + 偏移产物 +
   manifest（SHA256 校验）；设备在线按 `/proc/version` 自动匹配（精确 / 同族 /
   未收录三态）；未收录机型自动提取并生成新模块，可打包分享。
@@ -25,7 +25,7 @@
 - **P0 物理常量自动获取**：root /proc/iomem → 设备 devicetree（非 root）→
   素材 DTB → 待填，四级自动填充链；含 6 项反向校验。
 
-### 新机型流程闭环（v1.5 - v1.6）
+### 新机型流程闭环
 - **win_offs 去 vmlinux-to-elf 依赖**：内核 Image 直反汇编（capstone + 离线
   kallsyms）复现偏移，与 ELF 路径产物全等；vmlinux-to-elf 降级为可选。
 - **新机型流程 package 主导**：素材 → 可行性预检 → 自动提取全套 → 机型模块，
@@ -36,7 +36,7 @@
 - **非 b57 prebuilt 门禁**：主链优先使用机型模块自带产物；非 b57 且无产物时
   询问后默认不跑（避免 b57 预编译偏移硬编码导致的失败/panic），提示按机型重编译。
 
-### 编译自动化（v1.7）
+### 编译自动化
 - **exploit 自动编译**：非 b57 门禁处询问后自动用 WSL kali NDK（或自动下载
   Android NDK r28）按机型模块 target.h 编译 `glt_esync` 并放入模块；与历史
   构建同链（重编 w2host 与仓库产物 SHA256 全等）。
@@ -48,9 +48,20 @@
 
 - **vivo boot 头 page_size=0**：内核段定位失败导致 `内核缺少 arm64 Image magic`
   （unpack_boot.py / offline / winoffs-image 均修复，真实 OTA boot.img 验证）。
+- **prebuilt 二进制与源码同步重编**：发布流程改为每次用当前源码重编
+  `prebuilt/glt_esync` / `prebuilt/w2host`（WSL kali NDK），不再沿用旧二进制；
+  源码含 STAGE2（kptr 写）watchdog 修复（words[0] 必须 RED 防
+  `____rb_erase_color` 在垃圾树上旋转），干净状态真机验证：STAGE1→2 不再
+  watchdog，STAGE2 miss 安全重试，全链路 ALL STAGES PASS 且设备稳定。
 - **裸内核 Image（.img 无 ANDROID! 头）素材误判**为 boot.img 导致解包失败。
 - **detect-p0 低端 System RAM 小块**导致 phys_offset 误算为 0x0（改为基于内核
   加载所在 RAM 块推导）。
+- **detect-p0 多设备去重**：USB + 无线同一物理设备时按 ro.serialno 自动选用
+  （主链成功后的自动 P0 获取不再失败）。
+- **run_root.bat CRLF + ASCII 注释**：修复 LF 行尾 + UTF-8 中文注释导致 cmd
+  把注释碎片当命令执行（`'閫夊弬鏁伴€忎紶' is not recognized`）。
+- **多设备自动选择**：同一物理设备 USB + 无线双连接时自动选用 USB，
+  不再误报"检测到多台设备"。
 - **P0 待填模块导入即报错**：`load_profile` 允许 P0 null（待填态），模块分享
   闭环不再中断。
 - **--help / 未知子命令** 报 TypeError（改友好报错）。
@@ -71,6 +82,9 @@
 # 唯一入口（Windows）：
 run_root.bat
 # 或：powershell -ExecutionPolicy Bypass -File root.ps1
+
+# 一键发布 (重编二进制 + 打包 + 推送 + GitHub Release):
+python publish.py [--version v1.3.0] [--dry-run]
 
 # 生成/分享/导入机型模块：
 python tools\offset_tools\offsets_auto.py package C:\path\boot.img --out devices\my_device

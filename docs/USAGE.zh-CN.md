@@ -93,7 +93,7 @@ powershell -ExecutionPolicy Bypass -File root.ps1 -NoPanicDiag
 | Python | `-Python`、PATH（`python`/`py`/`python3`）、常见安装目录、WindowsApps | `winget install Python.Python.3` |
 | Python 依赖包 | `import capstone, elftools` 探测 | `pip install -r tools\offset_tools\requirements.txt` |
 | payload 提取工具 | PATH（`payload-dumper-go`）、仓库根 `payload_dumper.py`、WSL | GitHub release 的 `payload-dumper-go` 1.3.0 |
-| vmlinux-to-elf | PATH、Python 模块、WSL（**仅 derive-pselect 可选使用**） | `pip install vmlinux-to-elf`，失败回退 WSL pip；v1.5+ 的 win_offs 已改为 Image 直反汇编（`winoffs-image`），不再依赖此工具 |
+| vmlinux-to-elf | PATH、Python 模块、WSL（**仅 derive-pselect 可选使用**） | `pip install vmlinux-to-elf`，失败回退 WSL pip；win_offs 已改为 Image 直反汇编（`winoffs-image`），不再依赖此工具 |
 
 - `-SkipDeps` 关闭全部自动下载（离线 / 审查场景），仅打印手动安装指引。
 - `-DepsDir <path>` 覆盖依赖下载目录；`-DepsInPackage` 为 v1.1.0 起默认行为
@@ -115,7 +115,7 @@ powershell -ExecutionPolicy Bypass -File root.ps1 -NoPanicDiag
 - 采集全程只读、仅在主链退出后执行、不读写流式节点，**不会引发 panic**；
   `-NoPanicDiag` 可关闭。
 
-### vmlinux-to-elf 不再是 win_offs 依赖（v1.5+）
+### vmlinux-to-elf 不再是 win_offs 依赖
 
 偏移生成（winoffs）已改为 capstone 直接反汇编内核 Image（`winoffs-image`，
 符号用离线 kallsyms，boot.img 自动提取内核段 + 解压），**无需 vmlinux-to-elf**。
