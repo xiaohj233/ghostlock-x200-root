@@ -363,6 +363,10 @@ if ((Shell "cat /proc/modules 2>/dev/null | grep -E '^(myroot|permissive_restore
 
 $se_now = Shell "getenforce"
 $mods_now = Shell "cat /proc/modules 2>/dev/null | grep -E '^(kernelsu|myroot|permissive_restore)'"
+if ($mods_now -match 'kernelsu|myroot|permissive_restore') {
+  Write-Output "WARN: 检测到已加载 root 模块 (非干净状态): $($mods_now -replace "`n", '; ')"
+  Write-Output "WARN: 建议重启后再运行; 继续将走 RMMOD 重载清零路径, 该路径存在延迟 panic 风险 (历史偶发, 无变砖)"
+}
 if ($mods_now -match 'kernelsu' -and $se_now -eq 'Enforcing') {
   Write-Output "STAGE6 FAIL: kernelsu loaded but enforcing (permissive_restore missing) -> rootcmd dead, REBOOT and rerun"
   exit 1

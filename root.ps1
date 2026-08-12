@@ -1307,7 +1307,29 @@ if (-not $serial) { $serial = $env:ANDROID_SERIAL }
 if (-not $serial) {
   $devs = @(& $adb devices 2>$null | Select-String "`tdevice$" | ForEach-Object { ($_ -split "`t")[0] })
   if ($devs.Count -eq 1) { $serial = $devs[0] }
-  elseif ($devs.Count -gt 1) { SayErr "检测到多台设备, 请用 -Serial 指定: $($devs -join ', ')"; exit 1 }
+  elseif ($devs.Count -gt 1) {
+    # 同一物理设备可能 USB + 无线双连接 (如 10AEAC39B7000QN + 192.168.x.x:5555):
+    # 按 ro.serialno 去重, 唯一则自动选用 (优先 USB, 其次第一个)
+    $uniq = @{}
+    $pick = $null
+    foreach ($d in $devs) {
+      $phys = (& $adb -s $d shell getprop ro.serialno 2>$null | Out-String).Trim()
+      if (-not $phys) { $phys = $d }
+      if (-not $uniq.ContainsKey($phys)) {
+        $uniq[$phys] = $d
+        # 优先 USB (无 :port 后缀); 无线仅在无 USB 时兜底
+        if ($d -notmatch ':\d+$') { $pick = $d }
+        if (-not $pick) { $pick = $d }
+      }
+    }
+    if ($uniq.Count -eq 1) {
+      $serial = $pick
+      SayWarn "检测到同一设备的多个连接 (USB + 无线), 自动选用: $serial"
+    } else {
+      SayErr "检测到多台设备, 请用 -Serial 指定: $($devs -join ', ')"
+      exit 1
+    }
+  }
   else { SayErr "未检测到设备, 请连接手机并开启 USB 调试/无线调试"; exit 1 }
 }
 SayOk "设备: $serial"
