@@ -2365,6 +2365,17 @@ def _read_devicetree_memory_adb(serial):
     return addr
 
 
+def _adb_getprop(serial, prop):
+    """adb getprop (用于多设备去重: 同一物理设备 USB+无线 的 ro.serialno 相同)."""
+    try:
+        r = subprocess.run(["adb", "-s", serial, "shell", "getprop", prop],
+                           capture_output=True, text=True, timeout=10)
+        v = r.stdout.strip()
+        return v if r.returncode == 0 and v else ""
+    except Exception:
+        return ""
+
+
 def _detect_p0_from_iomem(text):
     """推导 (phys_offset, kernel_phys_load) + 6 项反向校验."""
     ranges = _parse_iomem(text)
@@ -2468,8 +2479,22 @@ def cmd_detect_p0(argv, profile, prof_path):
             devs = []
         if len(devs) == 1:
             serial = devs[0]
-        elif len(devs) > 1 and use_devicetree:
-            raise SystemExit("FATAL: 多台设备, 用 --serial 指定")
+        elif len(devs) > 1:
+            # 同一物理设备 USB + 无线 双连接: 按 ro.serialno 去重, 唯一则自动选 (USB 优先)
+            uniq = {}
+            pick = None
+            for d in devs:
+                phys = _adb_getprop(d, "ro.serialno") or d
+                if phys not in uniq:
+                    uniq[phys] = d
+                    if ":" not in d:
+                        pick = d
+                    if pick is None:
+                        pick = d
+            if len(uniq) == 1:
+                serial = pick
+            elif use_devicetree:
+                raise SystemExit("FATAL: 多台设备, 用 --serial 指定")
     if not serial:
         raise SystemExit(
             "FATAL: 需要 --iomem <文件> / --devicetree (设备在线) / --serial <sn>")

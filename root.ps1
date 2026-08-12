@@ -1426,7 +1426,7 @@ if ($rc -eq 0) {
     @($p0Log -split "`r?`n" | Where-Object { $_.Trim() }) | ForEach-Object { Say $_ }
     Say "如需固化到模块: python tools\offset_tools\offsets_auto.py detect-p0 --write-profile `"$ProfilePath`""
   } else {
-    SayWarn "detect-p0 未成功 (需要设备可 su 且 /proc/iomem 未隐藏)"
+    SayWarn "detect-p0 未成功 (设备 devicetree 不可读且无 su iomem; 不影响本次 root, 可后续手动补齐)"
   }
 }
 
