@@ -17,8 +17,6 @@ su_daemon_aarch64_pie
 !modules/permissive_restore/permissive_restore.ko
 !modules/kernelsu/kernelsu.ko
 *.so
-# local release-asset staging (download from GitHub Release)
-prebuilt/
 # root.ps1 依赖下载到项目根目录 (-DepsInPackage / -DepsDir <包根>)
 /platform-tools/
 /payload-dumper-go/
