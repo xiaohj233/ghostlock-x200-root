@@ -1,11 +1,13 @@
 @echo off
 setlocal
 rem ============================================================
-rem  GhostLock-X200: 唯一双击入口
-rem  - 运行 root.ps1, 结束后窗口停留 (报错不闪没)
-rem  - 日志自动写入 log\ 文件夹: log\ghostlock_root_<时间戳>.log
-rem    异常重启诊断包: log\ghostlock_diag_<时间戳>.zip
-rem  - 可选参数透传, 如: run_root.bat -AssetPath C:\path\boot.img
+rem  GhostLock-X200: single double-click entry (ASCII-only to
+rem  stay safe under any cmd codepage; keep this file CRLF).
+rem  - runs root.ps1, keeps window open (errors stay visible)
+rem  - logs: log\ghostlock_root_<timestamp>.log
+rem    panic diag bundle: log\ghostlock_diag_<timestamp>.zip
+rem  - extra args are passed through, e.g.:
+rem    run_root.bat -AssetPath C:\path\boot.img
 rem ============================================================
 cd /d "%~dp0"
 echo Starting GhostLock-X200 root.ps1 ...
