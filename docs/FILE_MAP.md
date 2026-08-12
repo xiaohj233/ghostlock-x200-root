@@ -1,4 +1,4 @@
-# FILE_MAP — GhostLock-X200 v1.3.0 file-by-file map
+# FILE_MAP — GhostLock-X200 v1.3.1 file-by-file map
 
 > Path → purpose → origin → license. README explains *how to use*; this file
 > explains *what every file is*. Provenance terms: COPIED (verbatim upstream),
@@ -11,7 +11,7 @@
 | `README.md` | user-facing README (Chinese: overview + comparisons; details in docs/USAGE.zh-CN.md) | LOCAL | Apache-2.0 |
 | `run_root.bat` | the single double-click entry: runs root.ps1, keeps window open (errors stay visible) | LOCAL | Apache-2.0 |
 | `log/` | runtime log `ghostlock_root_<timestamp>.log` + panic diag bundle `ghostlock_diag_<timestamp>.zip` (auto-generated, not tracked) | LOCAL | Apache-2.0 |
-| `release_notes_v1.3.0.md` | release changelog for v1.3.0 | LOCAL | Apache-2.0 |
+| `release_notes_v1.3.1.md` | release changelog for v1.3.1 | LOCAL | Apache-2.0 |
 | `docs/ARCHITECTURE.md` | architecture / STAGE flow / component map | LOCAL | Apache-2.0 |
 | `docs/FILE_MAP.md` | this file | LOCAL | Apache-2.0 |
 | `docs/USAGE.zh-CN.md` | detailed usage guide (Chinese): quick start, dependencies, params, FAQ | LOCAL | Apache-2.0 |

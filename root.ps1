@@ -1223,7 +1223,7 @@ function Collect-PanicDiag {
   $panicLikely = if ($reason -match 'panic|wdt|watchdog') { "内核 panic 或看门狗复位 (需结合 02_pstore 确认)" } else { "异常重启, 原因待确认" }
   $manifest = [ordered]@{
     tool          = "GhostLock-X200 root.ps1"
-    version       = "v1.3.0"
+    version       = "v1.3.1"
     collect_time  = $now
     mode          = $Mode
     device        = [ordered]@{
@@ -1289,7 +1289,7 @@ function Show-PanicGuide {
 # MAIN
 # ============================================================
 Say "=============================================="
-Say " GhostLock-X200 一键 Root (v1.3.0)"
+Say " GhostLock-X200 一键 Root (v1.3.1)"
 Say "=============================================="
 
 # 0. 依赖自检 (adb + python 依赖; -SkipDeps 跳过自动下载)
