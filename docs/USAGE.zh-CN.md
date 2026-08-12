@@ -229,6 +229,93 @@ socket 会被 SELinux 阻断，只能靠 permissive_restore 的延迟线程把 e
 | `winoffs` | kernel ELF | win_offs.json（physmap_base + sym_offs + w2host 窗口） |
 | `live` | kallsyms + BTF + win_offs | offsets.json（运行时动态值，同 STAGE3.4） |
 
+### 多机型参数（root.ps1）
+
+```powershell
+# 使用指定机型 profile（默认 profiles/x200_b57.json）
+powershell -ExecutionPolicy Bypass -File root.ps1 -Profile tools\offset_tools\profiles\x200_b57.json
+
+# 目标内核与 profile 不同时，自动重打 ko vermagic
+powershell -ExecutionPolicy Bypass -File root.ps1 -KernelRelease "6.6.89-android15-8-gb57af212129c-abogki457297774-4k"
+```
+
+profile 字段：`kernel_release`（设备 /proc/version 第 3 字段，完整 UTS_RELEASE）、
+`family`（内核族标识）、`soc`（dimensity/snapdragon 等）、
+`kimage_text_base`/`p0_*`/`identity_*`/`direct_map_*`/`vmemmap_start`/
+`physmap_base`（P0 常量）、`task_cred_off`、`verified`（真机验证通过才置 true）。
+偏移自动从素材重建，ko vermagic 自动重打，但**模块 modversions ABI 仍按编译时
+内核**——非同构建内核 insmod 可能失败。
+
+### 离线生成偏移（无需已 root 设备）
+
+```powershell
+# 1) 离线恢复 kallsyms + BTF (支持 boot.img / kernel.raw / kernel.elf; 6.1/6.6/6.12)
+python tools\offset_tools\offsets_auto.py offline C:\path\boot.img --out-dir C:\tmp\off
+
+# 2) 推导 pselect 栈布局 (需 kernel.elf + 离线产物 + objdump, Windows 或 WSL kali)
+python tools\offset_tools\offsets_auto.py derive-pselect C:\path\kernel.elf ^
+  --kallsyms C:\tmp\off\kallsyms.txt --btf C:\tmp\off\vmlinux.btf -o C:\tmp\off\pselect.json
+
+# 3) 生成 target header
+python tools\offset_tools\offsets_auto.py header C:\tmp\off\kallsyms.txt C:\tmp\off\vmlinux.btf ^
+  -o target.h --profile tools\offset_tools\profiles\x200_b57.json --pselect C:\tmp\off\pselect.json
+
+# 4) P0 物理常量 (已 root 同型号设备): 文件输入或 adb 自动
+python tools\offset_tools\offsets_auto.py detect-p0 --iomem iomem.txt
+python tools\offset_tools\offsets_auto.py detect-p0 --serial <SN> --write-profile tools\offset_tools\profiles\<机型>.json
+```
+
+root.ps1 素材流程会自动串联 1-3（选素材后离线恢复 + pselect + header），主链成功后
+自动尝试 detect-p0。
+
+### 机型模块与分享
+
+```powershell
+# 查看已安装模块 / 校验模块完整性
+python tools\offset_tools\offsets_auto.py verify-device x200_b57
+
+# 生成新机型模块 (未收录机型; 自动提取全套, P0 物理常量待填)
+python tools\offset_tools\offsets_auto.py package C:\path\boot.img --out devices\my_device --soc dimensity
+
+# 分享: 打包 devices\<机型名>\ 为 zip (含 manifest.json 校验和), 或直接拷贝目录
+# 导入: 解压到本项目 devices\ 下; 设备连接后按 /proc/version 自动精确命中
+
+# 编译 exploit 到指定机型模块 (默认 x200_b57)
+bash exploit/build/build_glt_esync.sh -t my_device
+bash exploit/build/build_w2host.sh -t my_device
+```
+
+> **模块分享约定**：`devices/` 是唯一可分享的机型目录；模块内偏移/参数为事实数据。
+> `kernel_release` 相同即精确命中（零提取直接使用）；仅 `family` 相同视为"同族可
+> 尝试"（需重新生成偏移）。ko 不入模块，导入后按 kernel_release 自动重打 vermagic。
+
+### 新机型编译（package 主导，无需 vmlinux-to-elf）
+
+```bash
+# 1) 生成机型模块 (boot.img 即可; P0 由 DTB/devicetree 自动填或标待填)
+python tools\offset_tools\offsets_auto.py package C:\path\boot.img ^
+  --out devices\my_device --vendor-boot C:\path\vendor_boot.img --soc dimensity
+
+# 2) 编译 exploit: root.ps1 门禁处可自动完成 (WSL kali NDK 或自动下载 NDK):
+#    - 自动: 运行 root.ps1 时提示 "是否自动编译本机型 exploit 产物? (y/N)" -> y
+#    - 手动: 用 Android NDK (aarch64-linux-android28-clang) 按机型模块编译
+bash exploit/build/build_glt_esync.sh -t my_device    # -> devices\my_device\prebuilt\glt_esync
+#    注: 只有 glt_esync 需要按机型编译 (target.h 编译期注入偏移);
+#    w2host 的采样窗口/候选范围已运行时注入 (W2_CRED_IPS 等), 无需重编,
+#    直接复用仓库 prebuilt\w2host (build_w2host.sh 仅用于修改 w2host.c 本身).
+
+# 3) 内核模块: vermagic 自动重打 (root.ps1 -KernelRelease), 但 modversions ABI
+#    仍需同构建内核源码重编 kernelsu/permissive_restore (非同构建可能 insmod 失败)
+```
+
+NDK 获取：Android Studio SDK Manager 或
+[android-ndk 官方下载](https://developer.android.com/ndk/downloads)（r29+）。
+本机 WSL kali 已装 NDK（`/usr/lib/android-ndk`）时自动编译零下载；否则 root.ps1
+询问后自动下载 NDK r28（Windows, ~1.1GB）到项目根。
+非 b57 机型必须按该机型模块 target.h 重编译 glt_esync（自动编译或手动），否则
+root.ps1 会询问"是否仍用 b57 预编译产物强跑？"（默认不跑，风险自担）。
+b57 命中时行为不变（直接用仓库 prebuilt/）。
+
 ### 适配其他构建（同平台，新 OTA）
 
 1. 使用**独立安装、具有明确许可证的 payload 提取工具**从新固件 boot.img 提取
