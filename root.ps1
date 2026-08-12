@@ -42,7 +42,8 @@ param(
   [string]$LogPath,        # 日志文件路径 (默认 <包根>\log\ghostlock_root_<时间戳>.log)
   [switch]$NoPanicDiag,    # 主链失败后不自动采集 panic 诊断日志 (默认开启)
   [string]$Profile,        # 机型 profile (默认 tools/offset_tools/profiles/x200_b57.json; 新机型: 复制改名填写)
-  [string]$KernelRelease   # 目标内核完整 UTS_RELEASE (如 /proc/version 第 3 字段); 与 profile 不同时自动重打 ko vermagic
+  [string]$KernelRelease,  # 目标内核完整 UTS_RELEASE (如 /proc/version 第 3 字段); 与 profile 不同时自动重打 ko vermagic
+  [switch]$SkipUptimeWait  # 透传: 跳过主链 uptime>240s 设备稳定等待 (设备刚重启时, 风险自担)
 )
 $ErrorActionPreference = 'SilentlyContinue'
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -911,9 +912,12 @@ function Get-DeviceOnline {
 }
 
 function Wait-DeviceOnline {
-  param([int]$Minutes = 12)
+  param([int]$Minutes = 3)
   for ($i = 0; $i -lt ($Minutes * 60 / 10); $i++) {
     if (Get-DeviceOnline) { return $true }
+    if ($i % 3 -eq 0) {
+      Say ("  等待设备上线中... 已等待 {0}s, 最长 {1}s (panic 后重启通常 1-2 分钟, 上线即继续)" -f ($i * 10), ($Minutes * 60))
+    }
     Start-Sleep -Seconds 10
   }
   return $false
@@ -1298,6 +1302,7 @@ if (-not $adb) { exit 1 }
 $env:ANDROID_ADB = $adb   # 透传给主链子进程 (主链优先用此路径)
 $python = Ensure-PythonDeps
 if (-not $python) { exit 1 }
+$oa = Join-Path $pkgRoot "tools\offset_tools\offsets_auto.py"
 SayOk "adb: $adb"
 SayOk "python: $python"
 
@@ -1370,7 +1375,6 @@ if ($Force) {
   $asset = Choose-Asset
 
   # 1. 机型可行性预检 (先摆上台面: 避免在 MTK 未知族 / init_boot 误选上空耗)
-  $oa = Join-Path $pkgRoot "tools\offset_tools\offsets_auto.py"
   $feasOut = (& $python $oa feasibility $asset --profile $ProfilePath 2>&1 | Out-String)
   Log-Raw ("[feasibility]`n" + $feasOut)
   @($feasOut -split "`r?`n") | ForEach-Object { if ($_.Trim()) { Say $_ } }
@@ -1389,6 +1393,22 @@ if ($Force) {
 # 记录运行前 boot_id, 用于主链失败后判断设备是否异常重启
 $bootIdBefore = (Get-BootIdNow)
 
+# 设备刚重启 (uptime<240s) 时主链会等待稳定: 在此交互层 (stdin 可靠) 询问是否跳过, 并透传 -SkipUptimeWait
+if (-not $SkipUptimeWait) {
+  $upRaw = (& $adb -s $serial shell cat /proc/uptime 2>$null | Out-String).Trim()
+  if ($upRaw -match '^\s*(\d+)') {
+    $upSec = [double]$matches[1]
+    if ($upSec -lt 240) {
+      $resp = ""
+      try { $resp = Read-Host ("设备刚重启 (uptime=${upSec}s), 未稳定就跳过等待可能导致内核 panic。仍要跳过 uptime>240s 稳定等待? (y/N)") } catch { }
+      if ($resp -match '^[yY]') {
+        $SkipUptimeWait = $true
+        SayWarn "已选择跳过设备稳定等待 (设备未稳定可能导致内核 panic, 风险自担)"
+      }
+    }
+  }
+}
+
 # 4. 调用主链
 $main = Join-Path $pkgRoot "tools\scripts\root_full_permissive_restore.ps1"
 $argsMain = @("-File", $main)
@@ -1402,6 +1422,7 @@ if ($ModuleGlt) { $argsMain += @("-GltPath", $ModuleGlt) }
 if ($GEN_WIN_OFFS) { $argsMain += @("-WinOffsPath", $GEN_WIN_OFFS) }
 if ($ProfilePath) { $argsMain += @("-ProfilePath", $ProfilePath) }
 if ($SkipPermissiveRestore) { $argsMain += "-SkipPermissiveRestore" }
+if ($SkipUptimeWait) { $argsMain += "-SkipUptimeWait" }
 
 Say "=============================================="
 Say "调用主链: $main"
@@ -1417,16 +1438,22 @@ if ($mainOutTee) {
   Log-Raw ("[主链输出]`n" + $mainOutput)
 }
 
-# 5.0 主链成功后: 自动尝试获取 P0 物理常量 (detect-p0, 需设备临时 su; 失败静默)
+# 5.0 主链成功后: 自动尝试获取 P0 物理常量 (detect-p0, 需设备临时 su; 失败不影响 root)
 if ($rc -eq 0) {
   Say "主链成功。尝试自动获取 P0 物理常量 (detect-p0, 需设备临时 su; 失败不影响) ..."
-  $p0Log = (& $python $oa detect-p0 2>&1 | Out-String)
-  Log-Raw ("[detect-p0]`n" + $p0Log)
-  if ($p0Log -match "p0_phys_offset") {
-    @($p0Log -split "`r?`n" | Where-Object { $_.Trim() }) | ForEach-Object { Say $_ }
+  $p0Out = (& $python $oa detect-p0 --serial $serial 2>&1 | Out-String)
+  if ($p0Out -notmatch "p0_phys_offset") {
+    # 主链刚结束 / 无线调试抖动时设备可能瞬时不可达: 3s 后重试一次
+    Start-Sleep -Seconds 3
+    $p0Out = (& $python $oa detect-p0 --serial $serial 2>&1 | Out-String)
+  }
+  Log-Raw ("[detect-p0]`n" + $p0Out)
+  if ($p0Out -match "p0_phys_offset") {
+    @($p0Out -split "`r?`n" | Where-Object { $_.Trim() }) | ForEach-Object { Say $_ }
     Say "如需固化到模块: python tools\offset_tools\offsets_auto.py detect-p0 --write-profile `"$ProfilePath`""
   } else {
-    SayWarn "detect-p0 未成功 (设备 devicetree 不可读且无 su iomem; 不影响本次 root, 可后续手动补齐)"
+    SayWarn "detect-p0 未成功 (设备不可达 / devicetree 不可读 / 无 su iomem); 不影响本次 root, 可后续手动补齐。原因:"
+    @($p0Out -split "`r?`n" | Where-Object { $_.Trim() }) | ForEach-Object { SayErr "  $_" }
   }
 }
 
@@ -1435,7 +1462,7 @@ if ($rc -eq 0) {
 if ($rc -ne 0 -and -not $NoPanicDiag) {
   $mode = "failure"
   if (-not (Get-DeviceOnline)) {
-    Say "设备当前离线, 等待重启完成 (最长 12 分钟)..."
+    Say "设备当前离线, 等待重启完成 (最长 3 分钟, 上线即继续)..."
     if (Wait-DeviceOnline) {
       $bidNow = Get-BootIdNow
       if ($bidNow -and $bootIdBefore -and $bidNow -ne $bootIdBefore) { $mode = "panic" }

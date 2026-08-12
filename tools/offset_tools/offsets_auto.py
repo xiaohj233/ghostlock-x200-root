@@ -2348,11 +2348,16 @@ def _parse_fdt_memory(dtb):
     return memory_reg
 
 
+def _adb_bin():
+    """adb 可执行文件: 优先取环境变量 ANDROID_ADB (root.ps1 已设置), 否则 PATH."""
+    return os.environ.get("ANDROID_ADB") or "adb"
+
+
 def _read_devicetree_memory_adb(serial):
     """adb (非 root) 读 /sys/firmware/devicetree/base/memory/reg → 首块 RAM 起点."""
     try:
         r = subprocess.run(
-            ["adb", "-s", serial, "shell",
+            [_adb_bin(), "-s", serial, "shell",
              "cat /sys/firmware/devicetree/base/memory/reg"],
             capture_output=True, timeout=30)
     except Exception as e:
@@ -2368,7 +2373,7 @@ def _read_devicetree_memory_adb(serial):
 def _adb_getprop(serial, prop):
     """adb getprop (用于多设备去重: 同一物理设备 USB+无线 的 ro.serialno 相同)."""
     try:
-        r = subprocess.run(["adb", "-s", serial, "shell", "getprop", prop],
+        r = subprocess.run([_adb_bin(), "-s", serial, "shell", "getprop", prop],
                            capture_output=True, text=True, timeout=10)
         v = r.stdout.strip()
         return v if r.returncode == 0 and v else ""
@@ -2414,7 +2419,7 @@ def _read_iomem_adb(serial):
     """adb su -c cat /proc/iomem (校验 uid=0)."""
     try:
         r = subprocess.run(
-            ["adb", "-s", serial, "shell", "su", "-c", "cat /proc/iomem"],
+            [_adb_bin(), "-s", serial, "shell", "su", "-c", "cat /proc/iomem"],
             capture_output=True, text=True, timeout=30)
     except Exception as e:
         raise SystemExit("FATAL: adb 调用失败: %s" % e)
@@ -2471,7 +2476,7 @@ def cmd_detect_p0(argv, profile, prof_path):
     # devicetree / 自动: 设备在线 (非 root 可读 /sys/firmware/devicetree)
     if not serial:
         try:
-            r = subprocess.run(["adb", "devices"], capture_output=True,
+            r = subprocess.run([_adb_bin(), "devices"], capture_output=True,
                                text=True, timeout=10)
             devs = [ln.split()[0] for ln in r.stdout.splitlines()[1:]
                     if len(ln.split()) >= 2 and ln.split()[1] == "device"]

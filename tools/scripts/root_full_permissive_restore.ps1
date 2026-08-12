@@ -10,7 +10,8 @@ param(
   [string]$W2HostPath, # override w2host binary (default: prebuilt/w2host; 机型模块可带)
   [string]$GltPath,    # override glt binary (default: prebuilt/glt_esync; 机型模块可带)
   [string]$ProfilePath, # override 机型模块 device.json (live 元数据用; 可选)
-  [switch]$SkipPermissiveRestore # do NOT load permissive_restore.ko; keep enforcing (network may break)
+  [switch]$SkipPermissiveRestore, # do NOT load permissive_restore.ko; keep enforcing (network may break)
+  [switch]$SkipUptimeWait         # skip the 240s uptime stability wait (risk: device may not be settled)
 )
 $ErrorActionPreference = 'SilentlyContinue'
 # ============================================================
@@ -168,8 +169,38 @@ function Mark([string]$s) {
 Write-Output "=== root_full_permissive_restore: permissive -> kptr(leaf-RED) -> CAPSROOT -> INSMOD permissive_restore+kernelsu -> 25s permissive ==="
 Write-Output "资产: KO=$KO_OFFICIAL PERM_RESTORE=$PERM_RESTORE_SRC GLT=$GLT W2=$W2HOST"
 
-# ---- 等待设备稳定 ----
-for ($i=0; $i -lt 40; $i++) { $u = (Shell "cat /proc/uptime").Split(' ')[0]; if ($u -and [double]$u -gt 240) { Write-Output "uptime=$u OK"; break }; Start-Sleep -Seconds 10 }
+# ---- 等待设备稳定 (uptime > 240s; 交互按 S 跳过, 或 -SkipUptimeWait 参数跳过) ----
+if ($SkipUptimeWait) {
+  Write-Output "参数 -SkipUptimeWait: 跳过设备稳定等待 (设备未稳定可能导致内核 panic, 风险自担)"
+} else {
+  # 按键跳过仅在真实控制台可用; stdin 被重定向 (管道/文件) 时 [Console]::KeyAvailable 必抛异常
+  $keySkip = $false
+  try { $keySkip = -not [Console]::IsInputRedirected } catch { $keySkip = $false }
+  if (-not $keySkip) {
+    Write-Output "提示: 当前输入非交互 (stdin 重定向), 按键 S 不可用; 如需跳过请加 -SkipUptimeWait 参数 (设备未稳定可能导致内核 panic)"
+  }
+  for ($i=0; $i -lt 40; $i++) {
+    $u = (Shell "cat /proc/uptime").Split(' ')[0]
+    if ($u -and [double]$u -gt 240) { Write-Output "uptime=$u OK"; break }
+    if ($i % 3 -eq 0) {
+      $cur = if ($u) { "$([math]::Round([double]$u))s" } else { "未知" }
+      $hint = if ($keySkip) { "; 按 S 跳过" } else { "" }
+      Write-Output ("等待设备稳定: uptime=$cur (<240s), 第 {0}/40 轮 (每 10s 轮询{1}) ..." -f ($i+1), $hint)
+    }
+    if ($keySkip) {
+      try {
+        if ([Console]::KeyAvailable) {
+          $k = [Console]::ReadKey($true)
+          if ($k.Key -eq [ConsoleKey]::S) {
+            Write-Output "已按 S 跳过设备稳定等待 (设备未稳定可能导致内核 panic, 风险自担)"
+            break
+          }
+        }
+      } catch { }
+    }
+    Start-Sleep -Seconds 10
+  }
+}
 if (-not (Alive)) { Write-Output "DEVICE NOT ALIVE"; exit 1 }
 
 # ---- 推送工具二进制 ----
