@@ -6,6 +6,13 @@ modules/permissive_restore/*.mod
 modules/permissive_restore/*.mod.c
 modules/permissive_restore/Module.symvers
 modules/permissive_restore/modules.order
+modules/clear_vr_tag/*.cmd
+modules/clear_vr_tag/.*.cmd
+modules/clear_vr_tag/*.o
+modules/clear_vr_tag/*.mod
+modules/clear_vr_tag/*.mod.c
+modules/clear_vr_tag/Module.symvers
+modules/clear_vr_tag/modules.order
 # exploit build artifacts
 exploit/.gl_build/
 *.elf
@@ -16,7 +23,12 @@ su_daemon_aarch64_pie
 # shipped in-tree prebuilt modules (GPL-2.0-only, tracked on purpose)
 !modules/permissive_restore/permissive_restore.ko
 !modules/kernelsu/kernelsu.ko
+!modules/clear_vr_tag/clear_vr_tag.ko
 *.so
+# dev / analysis / backup (not shipped)
+/.ksu_src/
+/modules/myhook/
+/prebuilt_bak_190436/
 # root.ps1 依赖下载到项目根目录 (-DepsInPackage / -DepsDir <包根>)
 /platform-tools/
 /payload-dumper-go/

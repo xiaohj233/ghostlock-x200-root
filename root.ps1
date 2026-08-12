@@ -1266,27 +1266,63 @@ function Collect-PanicDiag {
   return $manifest
 }
 
+function Get-LastStage {
+  # 从主链输出提取最后一次 STAGE 状态 (如 "STAGE5 FAIL after 5 rounds" / "STAGE2 OK kptr"),
+  # 用于报错窗口直接定位失败阶段。
+  param([string]$Output)
+  if (-not $Output) { return $null }
+  $m = @($Output -split "`r?`n" | Where-Object { $_ -match '^\s*STAGE\s*\d' -and $_ -match '(OK|FAIL|DOWN)' } | Select-Object -Last 1)
+  if ($m) { return $m.Trim() }
+  return $null
+}
+
 function Show-PanicGuide {
-  param([string]$ZipPath, $Manifest, [string]$Mode = "failure")
+  param([string]$ZipPath, $Manifest, [string]$Mode = "failure", [string]$Summary = "", [string]$MainOutput = "")
   if ($Mode -eq "panic") { SayErr "检测到设备异常重启 (内核 panic 或 watchdog 重启)。" }
   elseif ($Mode -eq "offline") { SayErr "主链执行失败且设备长时间未恢复 (可能关机/未开启调试)。已保存 host 侧日志。" }
   else { SayErr "主链执行失败 (设备未重启), 已采集现场诊断日志。" }
-  Say "==================== 诊断摘要 (可直接粘贴给 Agent) ===================="
+
+  # 失败阶段定位 (窗口第一眼可读)
+  $lastStage = Get-LastStage $MainOutput
+  if ($lastStage) { SayErr "失败定位: $lastStage" }
+
+  Say "==================== 诊断摘要 (截图/粘贴本窗口即可, 无需发 zip) ===================="
   Say ("tool=" + $Manifest.tool + " version=" + $Manifest.version + " mode=" + $Mode + " collect_time=" + $Manifest.collect_time)
-  Say ("device.brand=" + $Manifest.device.brand + " model=" + $Manifest.device.model)
-  Say ("device.build=" + $Manifest.device.build + " sdk=" + $Manifest.device.sdk)
-  Say ("device.kernel_version=" + $Manifest.device.kernel_version)
+  Say ("device.brand=" + $Manifest.device.brand + " model=" + $Manifest.device.model + " build=" + $Manifest.device.build + " sdk=" + $Manifest.device.sdk)
+  $kv = [string]$Manifest.device.kernel_version
+  if ($kv.Length -gt 100) { $kv = $kv.Substring(0, 100) + "..." }   # 超长内核版本行截断, 防窄窗口折行挤爆视口
+  Say ("device.kernel_version=" + $kv)
   Say ("device.kernel_build_hash=" + $Manifest.device.kernel_build_hash + " expected=" + $Manifest.device.expected_kernel_build)
-  Say ("boot.reason_raw=" + $Manifest.boot.reason_raw)
-  Say ("boot.panic_likely=" + $Manifest.boot.panic_likely)
-  Say ("diag_zip=" + $ZipPath)
+  Say ("boot.reason_raw=" + $Manifest.boot.reason_raw + " panic_likely=" + $Manifest.boot.panic_likely)
+  if ($Summary) {
+    foreach ($ln in @($Summary -split "`r?`n")) {
+      $t = $ln.Trim()
+      if ($t -match '^#\s' -and $t -notmatch '^##\s') { continue }   # 跳过文档大标题
+      if ($t -match '^##\s*') { Say ""; Say ("---- " + ($t -replace '^##\s*', '') + " ----") }
+      elseif ($t -match '^- ') { SayErr $t }
+      elseif ($t) {
+        if ($t.Length -gt 120) { $t = $t.Substring(0, 120) + "..." }
+        Say "  $t"
+      }
+    }
+  }
   Say "========================================================================"
   if ($Manifest.device.kernel_build_hash -and $Manifest.device.kernel_build_hash -ne $Manifest.device.expected_kernel_build) {
     SayErr "当前内核构建与工具预期不一致, 极可能机型/系统版本不兼容导致 panic; 此工具官方仅支持预期内核构建的机型。"
+    SayErr "此情况更推荐将上方诊断摘要连同 zip 发送给 Agent 分析 (可能需按目标内核重新适配)。"
   }
-  SayOk "诊断日志已就绪: $ZipPath"
-  Say "请将该 zip 文件 (连同上方诊断摘要) 发送给维护者/Agent 分析。"
-  Say "优先阅读 zip 内 00_SUMMARY.txt (AI 速读摘要); 01_boot_info 看机型/内核; 02_pstore/ 看 panic 栈; 06_local_tmp/glt_seq_*.txt 看最后动作。"
+  SayOk "诊断包: $ZipPath"
+  Say "窗口内容即诊断摘要; 若能发 zip 更好 (内含 00_SUMMARY.txt / 98_main_chain.log / 02_pstore/ panic 栈)。"
+  # 底部关键信息块: 默认视口 (约 25-30 行) 下截图必然包含, 保证一图可用
+  Say "==================== 关键信息 (截图务必包含以下行) ===================="
+  if ($lastStage) { SayErr "失败定位: $lastStage" } else { SayErr "失败定位: 未提取到 STAGE 状态 (主链无输出?)" }
+  if ($Manifest.device.kernel_build_hash -and $Manifest.device.kernel_build_hash -ne $Manifest.device.expected_kernel_build) {
+    SayErr ("内核匹配: 不匹配 (hash=" + $Manifest.device.kernel_build_hash + " expected=" + $Manifest.device.expected_kernel_build + ") → 更推荐发 Agent 分析")
+  } else {
+    SayOk ("内核匹配: match (" + $Manifest.device.kernel_build_hash + ")")
+  }
+  SayOk "诊断包: $ZipPath"
+  Say "========================================================================"
 }
 
 # ============================================================
@@ -1510,9 +1546,16 @@ if ($rc -ne 0 -and -not $NoPanicDiag) {
     SayErr "诊断日志打包失败, 原始目录保留在: $diagDir (可直接打包该目录发送)"
     $zip = $diagDir
   }
-  Show-PanicGuide $zip $manifest $mode
+  Show-PanicGuide $zip $manifest $mode $summary $mainOutput
 } elseif ($rc -ne 0) {
   SayErr "-NoPanicDiag: 未采集诊断; 如需分析请发送运行日志: $LOG_FILE"
+  $lastStage = Get-LastStage $mainOutput
+  if ($lastStage) { SayErr "失败定位: $lastStage" }
+  $tail = @($mainOutput -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -Last 12)
+  if ($tail) {
+    Say "---- 主链输出尾部 (失败点) ----"
+    foreach ($t in $tail) { SayErr "  $t" }
+  }
 }
 if ($LOG_FILE -and (Test-Path -LiteralPath $LOG_FILE)) { SayOk "运行日志已保存: $LOG_FILE" }
 exit $rc

