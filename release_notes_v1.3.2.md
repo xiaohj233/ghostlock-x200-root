@@ -27,9 +27,6 @@
 # 唯一入口（Windows）：
 run_root.bat
 # 或：powershell -ExecutionPolicy Bypass -File root.ps1
-
-# 一键发布 (重编二进制 + 打包 + 校验 + 提交推送 + GitHub Release):
-python publish.py [--version v1.3.2] [--dry-run]
 ```
 
 详细文档见 `docs/USAGE.zh-CN.md`；文件清单见 `docs/FILE_MAP.zh-CN.md`。
