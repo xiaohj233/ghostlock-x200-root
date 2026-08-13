@@ -1,4 +1,4 @@
-﻿# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 GhostLock-X200 contributors
 # ============================================================
 # root.ps1 - GhostLock-X200 一键 Root (小白友好 / GUI 引导)
@@ -1227,7 +1227,7 @@ function Collect-PanicDiag {
   $panicLikely = if ($reason -match 'panic|wdt|watchdog') { "内核 panic 或看门狗复位 (需结合 02_pstore 确认)" } else { "异常重启, 原因待确认" }
   $manifest = [ordered]@{
     tool          = "GhostLock-X200 root.ps1"
-    version       = "v1.3.3"
+    version       = "v1.3.4"
     collect_time  = $now
     mode          = $Mode
     device        = [ordered]@{
@@ -1329,7 +1329,7 @@ function Show-PanicGuide {
 # MAIN
 # ============================================================
 Say "=============================================="
-Say " GhostLock-X200 一键 Root (v1.3.3)"
+Say " GhostLock-X200 一键 Root (v1.3.4)"
 Say "=============================================="
 
 # 0. 依赖自检 (adb + python 依赖; -SkipDeps 跳过自动下载)
@@ -1349,7 +1349,7 @@ if (-not $serial) {
   $devs = @(& $adb devices 2>$null | Select-String "`tdevice$" | ForEach-Object { ($_ -split "`t")[0] })
   if ($devs.Count -eq 1) { $serial = $devs[0] }
   elseif ($devs.Count -gt 1) {
-    # 同一物理设备可能 USB + 无线双连接 (如 10AEAC39B7000QN + 192.168.x.x:5555):
+    # 同一物理设备可能 USB + 无线双连接 (如 <serial> + 192.168.x.x:5555):
     # 按 ro.serialno 去重, 唯一则自动选用 (优先 USB, 其次第一个)
     $uniq = @{}
     $pick = $null

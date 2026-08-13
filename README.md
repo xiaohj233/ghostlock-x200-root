@@ -2,9 +2,9 @@
 SPDX-FileCopyrightText: 2026 GhostLock-X200 contributors
 SPDX-License-Identifier: Apache-2.0
 -->
-# GhostLock-X200 v1.3.3
+# GhostLock-X200 v1.3.4
 
-![Version](https://img.shields.io/badge/version-v1.3.3-blue.svg)
+![Version](https://img.shields.io/badge/version-v1.3.4-blue.svg)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green.svg)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%2B%20Android-orange.svg)
 ![Kernel](https://img.shields.io/badge/kernel-6.6.89%20b57-lightgrey.svg)
@@ -90,7 +90,7 @@ Bootloader、不需要刷机、不会清空数据。运行后获得临时 root�
 
 ## 快速开始
 
-1. 下载 Release 资产 `ghostlock-x200-root-v1.3.3.zip` 并解压（zip 内含
+1. 下载 Release 资产 `ghostlock-x200-root-v1.3.4.zip` 并解压（zip 内含
    `prebuilt/` 二进制与 `modules/*.ko`，缺一不可）；
 2. **唯一入口**：双击 `run_root.bat`（运行结束后窗口停留，报错不闪没）；或命令行：
 

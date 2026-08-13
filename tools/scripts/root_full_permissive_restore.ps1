@@ -115,6 +115,10 @@ function Alive { return ((Adb "shell echo ok").Trim() -eq 'ok') }
 function Rootcmd($cmd) { Adb "forward tcp:$PORT localfilesystem:$dev_sock" | Out-Null; return ([string](& $python $ROOTCMD_CLI "$cmd" 2>&1 | Out-String)).Trim() }
 
 # ---- 镜像固有偏移 (win_offs_b57.json: 离线反汇编产物, 跨 boot 固定) ----
+if (-not (Test-Path $WIN_OFFS)) {
+  Write-Output "WIN OFFS MISSING: $WIN_OFFS - pass a valid -WinOffsPath (win_offs_*.json)"
+  exit 1
+}
 $win = Get-Content $WIN_OFFS -Raw | ConvertFrom-Json
 $pmb = [Convert]::ToUInt64($win.physmap_base,16)
 $se_p0 = ('0x{0:x}' -f ($pmb + [Convert]::ToUInt64($win.sym_offs.selinux_state,16)))
@@ -478,6 +482,29 @@ $bid = (Shell "cat /proc/sys/kernel/random/boot_id 2>/dev/null").Trim()
 if ($bid -and $PERM_RESTORE_SRC) { Set-Content $GL_STATE ("$bid`n0"); Write-Output "STAGE6: GL 宿主已清零, 槽位重置 -> 无限提权" }
 elseif ($bid) { Write-Output "STAGE6: -SkipPermissiveRestore, GL 宿主未清零 (槽位状态保留)" }
 
+# ---- STAGE6.1: ksud 就位 (sucompat 重定向目标, 必须先于一切 su 使用) ----
+# KernelSU sucompat 把所有 su 调用重定向执行 /data/adb/ksud。该文件缺失或损坏
+# 时 (首次装机 / ksud install 半途失败), 全部 su 报 "su: inaccessible or not
+# found" -> 后续 STAGE6.5/STAGE8 以及 manager 模块页/超级用户页全部失败。
+# 此处确保其为完整 ELF: su 可用时用 su 检查/修复; su 不可用时回退 rootcmd
+# (CHMOD 777 /data/adb 后 adb shell 直接 cp)。
+if ($KO_OFFICIAL) {
+  $kchk = Shell "su -c 'head -c 4 /data/adb/ksud 2>/dev/null | xxd -p'"
+  if ($kchk -eq '7f454c46') {
+    Write-Output "STAGE6.1: /data/adb/ksud ELF OK"
+  } else {
+    Write-Output "STAGE6.1: /data/adb/ksud missing/broken ('$kchk'), repairing ..."
+    Rootcmd "MKDIR /data/adb" | Out-Null
+    Rootcmd "CHMOD 777 /data/adb" | Out-Null
+    Shell "cp $dev_ksud /data/adb/ksud; chmod 755 /data/adb/ksud" | Out-Null
+    Rootcmd "CHMOD 755 /data/adb" | Out-Null
+    Rootcmd "CHOWN 0 1000 /data/adb" | Out-Null
+    $kchk2 = Shell "su -c 'head -c 4 /data/adb/ksud 2>/dev/null | xxd -p'"
+    if ($kchk2 -eq '7f454c46') { Write-Output "STAGE6.1 OK: repaired, su back online" }
+    else { Write-Output "STAGE6.1 WARN: repair failed ('$kchk2'), su may not work" }
+  }
+}
+
 # ---- STAGE6.5: vr.ko 反 root 对抗 (clear_vr_tag) ----
 # 必须在内核/manager 使用前加载: kretprobe commit_creds 只在"非root->root"
 # 提权时清 vr 标记 + TIF_SYSCALL_TRACEPOINT, 否则 KernelSU libksud.so 提权
@@ -505,11 +532,13 @@ if ($cc_addr) {
       } catch { Write-Output "STAGE6.5 WARN: vr_offsets.json parse failed, using defaults" }
     }
     Write-Output "STAGE6.5: INSMOD clear_vr_tag cc_addr=$cc_addr tag_a=$vrTagA tag_b=$vrTagB tp=$vrTp ..."
-    $r = Rootcmd "INSMOD $dev_clear_vr_tag cc_addr=$cc_addr tag_a_off=$vrTagA tag_b_off=$vrTagB tp_flag=$vrTp"
+    # rootcmd socket 在 INSMOD kernelsu 后已被 KSU 阻断 (见 STAGE6 注释),
+    # 此处改用 su -c insmod (STAGE6 allow_shell=1 已生效)。
+    $r = Shell "su -c 'insmod $dev_clear_vr_tag cc_addr=$cc_addr tag_a_off=$vrTagA tag_b_off=$vrTagB tp_flag=$vrTp' 2>&1"
     Write-Output "INSMOD clear_vr_tag ret: $r"
     Start-Sleep -Seconds 2
     $m = Shell "cat /proc/modules 2>/dev/null | grep '^clear_vr_tag'"
-    if ($m -notmatch 'clear_vr_tag') { Write-Output "STAGE6.5 WARN: clear_vr_tag not loaded: '$m'" }
+    if ($m -notmatch 'clear_vr_tag') { Write-Output "STAGE6.5 FAIL: clear_vr_tag not loaded: '$m'" }
     else { Write-Output "STAGE6.5 OK: $m" }
   }
 } else {
@@ -551,22 +580,41 @@ if ($KO_OFFICIAL) {
 }
 Shell ("echo 'ALL STAGES PASS host=" + (Get-Date -Format "HH:mm:ss") + "' >> $dev_seq") | Out-Null
 
-# ---- STAGE8: 启动 ksud daemon (模块页/超级用户页依赖) ----
-# allowlist(uid 2000) + sucompat -> `su -c` 以 root + su 域执行 -> 启动
-# /data/adb/ksud services (daemon). 无它时 manager 模块页/超级用户页转圈.
+# ---- STAGE8: ksud 就位 (sucompat 重定向目标) + manager 注册 + ksud daemon ----
+# 根因修复 (v1.3.4): KernelSU sucompat 把 su 调用重定向执行 /data/adb/ksud。
+# 主链此前只把 ksud push 到 /data/local/tmp/ksud_$tag; 一旦 /data/adb/ksud
+# 缺失或被破坏 (如 ksud install 半途失败), 所有 su 全部失败
+# ("su: inaccessible or not found") -> manager 模块页/超级用户页永久转圈。
+# 此处先确保 /data/adb/ksud 为完整 ELF, 再注册 manager (ksud debug get-sign,
+# 内核据此识别 manager uid 自动放行), 最后启动 ksud daemon。
 $su_test = Shell "su -c 'id' 2>&1 | head -1"
 if ($su_test -match 'uid=0') {
-  Write-Output "STAGE8: su works ($su_test), starting ksud daemon ..."
+  Write-Output "STAGE8: su works ($su_test), installing ksud + registering manager ..."
+  $ktype = Shell "su -c 'head -c 4 /data/adb/ksud 2>/dev/null | xxd -p'"
+  if ($ktype -ne '7f454c46') {
+    Shell "su -c 'cp $dev_ksud /data/adb/ksud && chmod 755 /data/adb/ksud'" | Out-Null
+    Write-Output "STAGE8: /data/adb/ksud repaired (head-4 was '$ktype', now full ELF)"
+  } else {
+    Write-Output "STAGE8: /data/adb/ksud already ELF (no repair needed)"
+  }
+  $mgrPath = (Shell "pm path me.weishu.kernelsu 2>/dev/null | head -1") -replace '^package:',''
+  if ($mgrPath -and $mgrPath -match '\.apk$') {
+    $sig = Shell "su -c '$dev_ksud debug get-sign $mgrPath 2>&1'"
+    Write-Output "STAGE8: manager get-sign: $sig"
+  } else {
+    Write-Output "STAGE8 WARN: manager apk not found (pm path), get-sign skipped"
+  }
   Shell "su -c 'nohup /data/adb/ksud services > /data/local/tmp/ksud_$tag.log 2>&1 &'"
   Start-Sleep -Seconds 3
-  $ksud = Shell "ps -A 2>/dev/null | grep -E '^[ ]*[0-9]+ .*ksud' | head -2"
+  $ksud = Shell "ps -A -o PID,ARGS 2>/dev/null | grep -F ksud | grep -v grep | head -2"
   if ($ksud) { Write-Output "STAGE8 OK: ksud daemon up: $ksud" }
   else {
-    Write-Output "STAGE8 WARN: ksud daemon not detected"
+    Write-Output "STAGE8 INFO: ksud daemon not detected (services 命令一次性退出属正常; manager 自带 libksud.so 不依赖常驻 ksud)"
     $kl = Shell "cat /data/local/tmp/ksud_$tag.log 2>/dev/null | head -5"
     Write-Output "ksud log: $kl"
   }
 } else {
   Write-Output "STAGE8 WARN: su not working for shell ($su_test) - ksud daemon skipped"
 }
+
 Write-Output "DONE"
