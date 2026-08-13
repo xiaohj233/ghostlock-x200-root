@@ -395,12 +395,16 @@ Write-Output "STAGE3.5: clear_vr_tag.ko ($((Get-Item $CLEAR_VR_TAG_PATCHED).Leng
 Mark "STAGE3.5 OK"
 
 # ---- STAGE4 前静默门 (v1.3.5 根因修复): 设备忙时写链必 miss ----
-# 实测对照: 空闲 2/2 命中, 设备忙 (IO/CPU 风暴) 0/2 miss。STAGE3.4/3.5 的
-# kallsyms+BTF 拉取与 patch_all 反汇编后设备仍忙, 立即写 -> R1 miss。
-# 等待 loadavg(1min) 回落 + 最少 12s 静默, 上限 120s 未静默则 WARN 继续
-# (设备后台应用如 QQ MSF 可能长期占 CPU, 不无限等; 本门禁只吸收工具自身的
-# adb 拉取/反汇编负载, 不追求吸收用户应用负载)。等待语义, 不增加写重试。
-$qDeadline = (Get-Date).AddSeconds(30)
+# 实测对照: 空闲 2/2 命中, 设备忙 (IO/CPU 风暴) 0/2 miss; 极端负载
+# (loadavg=50, D 态堆积) 下 STAGE5 写链 R1 直接 kernel_panic (21:00
+# 用户逻辑测试实证, 同一段写链代码在 loadavg<=16 时 7/7 通过)。
+# 策略: 等待 loadavg(1min) 回落 + 最少 12s 静默, 上限 60s:
+#   loadavg < 1.5            -> 继续 (R1 大概率命中)
+#   1.5 <= loadavg < 20      -> WARN 继续 (16-17 实测安全, R2 覆盖)
+#   loadavg >= 20            -> 硬中止 (panic 风险不可接受; STAGE1/2 已做的
+#                               permissive/kptr 改动重启即恢复)
+# 等待语义, 不增加写重试。
+$qDeadline = (Get-Date).AddSeconds(60)
 $qWait = 0
 $load1 = 0.0
 do {
@@ -411,8 +415,13 @@ do {
   Start-Sleep -Seconds 2
   $qWait += 2
 } while ((Get-Date) -lt $qDeadline)
+if ($load1 -ge 20) {
+  Write-Output "STAGE4 QUIESCE ABORT: 设备负载过高 (loadavg=$load1), 写链存在 kernel_panic 风险, 已停止"
+  Write-Output "  (STAGE1/2 已做的 permissive/kptr 改动重启即恢复; 请关闭后台应用 (QQ 等) 或等设备空闲后重跑)"
+  exit 1
+}
 if ($load1 -ge 1.5) {
-  Write-Output "STAGE4 QUIESCE WARN: loadavg=$load1 30s 内未静默 (设备后台负载, 如 QQ MSF), 继续 (R1 miss 概率升高, 由 ROUND 覆盖)"
+  Write-Output "STAGE4 QUIESCE WARN: loadavg=$load1 60s 内未静默 (设备后台负载, 如 QQ MSF), 继续 (R1 miss 概率升高, 由 ROUND 覆盖)"
 } else {
   Write-Output "STAGE4 QUIESCE OK: loadavg=$load1 wait=${qWait}s"
 }
