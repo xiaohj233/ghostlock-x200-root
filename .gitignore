@@ -38,6 +38,7 @@ su_daemon_aarch64_pie
 /payload-dumper-go_1.3.0_windows_amd64.tar.gz
 # release 资产 (gh release 上传, 不进 git)
 /ghostlock-x200-root-v*.zip
+/publish.py
 # 运行日志 / 异常重启诊断包
 /log/
 # python

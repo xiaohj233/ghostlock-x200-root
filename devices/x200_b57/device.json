@@ -1,5 +1,6 @@
 {
   "device": "vivo X200 (PD2415)",
+  "product_device": "PD2415",
   "kernel_release": "6.6.89-android15-8-gb57af212129c-abogki457297774-4k",
   "family": "b57",
   "soc": "dimensity",

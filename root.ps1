@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: Apache-2.0
+﻿# SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 GhostLock-X200 contributors
 # ============================================================
 # root.ps1 - GhostLock-X200 一键 Root (小白友好 / GUI 引导)
@@ -179,7 +179,7 @@ function Get-FileKind {
 
 # ---------- 机型模块自动匹配 (v1.4): 按 /proc/version 扫描 devices/ ----------
 function Match-DeviceModule {
-  param([string]$VerLine)
+  param([string]$VerLine, [string]$ProductDevice)
   $devRoot = Join-Path $pkgRoot "devices"
   if (-not (Test-Path -LiteralPath $devRoot)) { return $null }
   $familyHit = $null
@@ -188,6 +188,13 @@ function Match-DeviceModule {
     if (-not (Test-Path -LiteralPath $djp)) { continue }
     try { $dj = Get-Content -LiteralPath $djp -Raw -Encoding UTF8 | ConvertFrom-Json } catch { continue }
     if ($dj.kernel_release -and $VerLine -like ("*" + $dj.kernel_release + "*")) {
+      # 机型门禁: 同一内核构建可被多机型共用 (实测 PD2419/iQOO13 与 PD2415/X200
+      # UTS_RELEASE 相同), 但偏移仅按 product_device 对应的机型验证过。
+      # 其他机型静默使用会写错偏移 -> panic/watchdog; 必须走自适配重建。
+      if ($dj.product_device -and $ProductDevice -and $dj.product_device -ne $ProductDevice) {
+        # 机型不符: 落到 family 命中 -> 引导"同族未精确匹配, 需重新生成偏移"
+        return @{ path = $djp; level = "family"; device = $dj }
+      }
       return @{ path = $djp; level = "exact"; device = $dj }
     }
     if (-not $familyHit -and $dj.family -and $VerLine -like ("*" + $dj.family + "*")) {
@@ -1378,7 +1385,9 @@ SayOk "设备: $serial"
 # 3. build 检测 + 机型模块自动匹配 (v1.4)
 $ver = (& $adb -s $serial shell cat /proc/version 2>$null | Out-String).Trim()
 Say "内核版本: $($ver.Split([Environment]::NewLine)[0])"
-$modMatch = Match-DeviceModule $ver
+$prodDev = (& $adb -s $serial shell getprop ro.product.device 2>$null | Out-String).Trim()
+Say "机型: $prodDev"
+$modMatch = Match-DeviceModule $ver $prodDev
 
 if ($Force) {
   SayWarn "-Force: 跳过机型匹配, 强制使用 $ProfilePath 直接运行 (偏移不匹配有 panic 风险, 风险自担!)"
