@@ -262,11 +262,16 @@ function Ensure-NDK {
     return $n
   }
   if ($SkipDeps) { SayErr "未找到 NDK (离线模式 -SkipDeps). 手动: 设置 ANDROID_NDK_HOME, 或 WSL kali 安装 android-ndk"; return $null }
-  SayWarn "未找到 NDK (exploit 编译需要 aarch64-linux-android28-clang)"
-  $resp = Read-Host "是否自动下载 Android NDK r28 (Windows, ~1.1GB, Google 官方) 到项目根? (y/N)"
-  if ($resp -notmatch '^[yY]') { SayErr "已取消; 可设置 ANDROID_NDK_HOME 或 WSL kali 装 NDK 后重试"; return $null }
   $dep = Get-DepsDir
   $zip = Join-Path $dep "android-ndk-r28-windows.zip"
+  $ndkDir = Join-Path $dep "ndk"
+  SayWarn "未找到 NDK: 本机无 WSL kali NDK, 也未安装 Windows NDK (编译本机型 glt 必需)"
+  Say "将自动下载 Android NDK r28 (Windows 版, Google 官方源 dl.google.com):"
+  Say ("  下载体积: 约 1.1GB (解压后约 4GB)")
+  Say ("  压缩包将保存到: " + $zip)
+  Say ("  解压目录: " + $ndkDir + " (仅首次下载, 之后自动复用)")
+  $resp = Read-Host "是否确认下载? (y/N)"
+  if ($resp -notmatch '^[yY]') { SayErr "已取消; 可设置 ANDROID_NDK_HOME 或 WSL kali 装 NDK 后重试"; return $null }
   Say "下载 NDK r28 (约 1.1GB, 仅首次; 之后 deps 复用) ..."
   $ok = Download-Url "https://dl.google.com/android/repository/android-ndk-r28-windows.zip" $zip
   if (-not $ok) { SayErr "NDK 下载失败 (需联网). 手动: https://developer.android.com/ndk/downloads"; return $null }
@@ -449,8 +454,8 @@ function Invoke-DeviceBuild {
     # 主链回退仓库 prebuilt/w2host 即可
     $script:ModuleGlt = $modGlt
     SayOk "模块自带 glt_esync (按本机型编译), w2host 复用仓库 prebuilt (运行时自适应)"
-  } elseif ($script:ProfileInfo.family -and [string]$script:ProfileInfo.family -ne "b57") {
-    SayWarn "非 b57 机型且模块无自带 glt_esync 产物 (prebuilt/glt_esync 为 b57 编译, 偏移不匹配; w2host 运行时自适应可直接用)"
+  } elseif ([string]$script:ProfileInfo.family -ne "b57") {
+    SayWarn "非 b57 机型且模块无自带 glt_esync 产物 (prebuilt/glt_esync 为 b57 编译, 偏移不匹配, 禁止直接使用)"
     $resp = Read-Host "是否自动编译本机型 exploit 产物? (WSL kali NDK / 自动下载 NDK; y/N)"
     if ($resp -match '^[yY]') {
       $built = Invoke-ExploitBuild -DeviceId $newDevId
@@ -464,9 +469,7 @@ function Invoke-DeviceBuild {
       SayWarn "跳过自动编译; 手动: bash exploit/build/build_glt_esync.sh -t $newDevId -> devices\$newDevId\prebuilt\"
     }
     if (-not $script:ModuleGlt) {
-      $resp = Read-Host "是否仍用 b57 预编译产物强跑? (y/N)"
-      if ($resp -notmatch '^[yY]') { SayErr "已取消 (主链未运行); 编译产物后再试"; return "cancelled" }
-      SayWarn "继续使用 b57 预编译 glt_esync (偏移不匹配, 风险自担)"
+      SayErr "本机型 glt 未编译, 已终止 (不会静默回退 b57 预编译产物; 编译产物后重试)"; return "cancelled"
     }
   }
   return @{ ok = $true; win_offs = $newWin; profile_path = $script:ProfilePath }
@@ -1164,7 +1167,7 @@ function Collect-PanicDiag {
   New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
   $tmpNames = @((AdbSh "ls /data/local/tmp/ 2>/dev/null") -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
   foreach ($n in $tmpNames) {
-    if ($n -match '^(glt_seq_|w2h_|w2dbg_|w2cred_|rootproof_|dmesg_pre_|run\.sh$|w\.log$|rootcmd_|diag_root_)') {
+if ($n -match '^(glt_seq_|w2h_|w2dbg_|w2cred_|rootproof_|capsroot_|dmesg_pre_|run\.sh$|w\.log$|rootcmd_|diag_root_)') {
       if ($n -match '\.sock$') { continue }   # socket 文件无内容, 跳过
       $safe = ($n -replace '[^\w\.\-]', '_')
       if ($n -match '^diag_root_') {
@@ -1234,7 +1237,7 @@ function Collect-PanicDiag {
   $panicLikely = if ($reason -match 'panic|wdt|watchdog') { "内核 panic 或看门狗复位 (需结合 02_pstore 确认)" } else { "异常重启, 原因待确认" }
   $manifest = [ordered]@{
     tool          = "GhostLock-X200 root.ps1"
-    version       = "v1.3.4"
+    version       = "v1.3.5-beta3"
     collect_time  = $now
     mode          = $Mode
     device        = [ordered]@{
@@ -1293,7 +1296,7 @@ function Show-PanicGuide {
   $lastStage = Get-LastStage $MainOutput
   if ($lastStage) { SayErr "失败定位: $lastStage" }
 
-  Say "==================== 诊断摘要 (截图/粘贴本窗口即可, 无需发 zip) ===================="
+  Say "==================== 诊断摘要 (请同时发送下方诊断包 zip) ===================="
   Say ("tool=" + $Manifest.tool + " version=" + $Manifest.version + " mode=" + $Mode + " collect_time=" + $Manifest.collect_time)
   Say ("device.brand=" + $Manifest.device.brand + " model=" + $Manifest.device.model + " build=" + $Manifest.device.build + " sdk=" + $Manifest.device.sdk)
   $kv = [string]$Manifest.device.kernel_version
@@ -1319,7 +1322,7 @@ function Show-PanicGuide {
     SayErr "此情况更推荐将上方诊断摘要连同 zip 发送给 Agent 分析 (可能需按目标内核重新适配)。"
   }
   SayOk "诊断包: $ZipPath"
-  Say "窗口内容即诊断摘要; 若能发 zip 更好 (内含 00_SUMMARY.txt / 98_main_chain.log / 02_pstore/ panic 栈)。"
+  Say "请务必一并发送下方诊断包 zip (内含 00_SUMMARY.txt / 98_main_chain.log / 02_pstore/ panic 栈, 用于定位崩溃点)。"
   # 底部关键信息块: 默认视口 (约 25-30 行) 下截图必然包含, 保证一图可用
   Say "==================== 关键信息 (截图务必包含以下行) ===================="
   if ($lastStage) { SayErr "失败定位: $lastStage" } else { SayErr "失败定位: 未提取到 STAGE 状态 (主链无输出?)" }
@@ -1336,7 +1339,7 @@ function Show-PanicGuide {
 # MAIN
 # ============================================================
 Say "=============================================="
-Say " GhostLock-X200 一键 Root (v1.3.4)"
+Say " GhostLock-X200 一键 Root (v1.3.5-beta3)"
 Say "=============================================="
 
 # 0. 依赖自检 (adb + python 依赖; -SkipDeps 跳过自动下载)
@@ -1407,6 +1410,32 @@ if ($Force) {
     $rebuild = Invoke-DeviceBuild -Asset $asset -WorkDir $work
     if ($null -eq $rebuild) { SayErr "机型模块生成失败"; exit 1 }
     if ($rebuild -eq "cancelled") { SayErr "已取消"; exit 1 }
+  }
+  # ---- glt 门禁 (v1.3.5): 非 b57 机型禁止静默回退仓库 prebuilt/glt_esync ----
+  # prebuilt/glt_esync 按 x200_b57 target.h 编译 (SLIDE_INIT_TASK_OFF/FAKE_TASK_*
+  # 等编译期偏移), 跑在其他内核上链走唤醒路径必 panic (V2339A 6.1.145 实证:
+  # STAGE1 R1 miss -> R2+ 高概率 panic)。非 b57 机型必须用 devices/<id>/prebuilt/
+  # glt_esync; 缺失自动编译, 失败即终止 (不提供强跑选项)。
+  if (-not $script:ModuleGlt) {
+    $exactDevDir = Split-Path -Parent $ProfilePath
+    $exactDevId  = Split-Path -Leaf $exactDevDir
+    $isB57 = ([string]$ProfileInfo.family -eq "b57") -or ($exactDevId -eq "x200_b57")
+    if (-not $isB57) {
+      $modGltE = Join-Path $exactDevDir "prebuilt\glt_esync"
+      if (Test-Path -LiteralPath $modGltE) {
+        $script:ModuleGlt = $modGltE
+        SayOk "机型模块自带 glt: $modGltE"
+      } else {
+        SayWarn "非 b57 机型且模块缺 prebuilt/glt_esync, 自动编译本机型 glt (需 NDK; 无 WSL kali NDK 时会提示下载 Windows 版)..."
+        $builtE = Invoke-ExploitBuild -DeviceId $exactDevId
+        if ($builtE) {
+          $script:ModuleGlt = $builtE.glt
+          SayOk "主链将使用本机型自动编译 glt: $($builtE.glt)"
+        } else {
+          SayErr "本机型 glt 编译失败, 已终止 (不会静默回退 b57 预编译产物)"; exit 1
+        }
+      }
+    }
   }
 } else {
   if ($modMatch) {

