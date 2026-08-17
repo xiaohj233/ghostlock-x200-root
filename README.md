@@ -2,9 +2,9 @@
 SPDX-FileCopyrightText: 2026 GhostLock-X200 contributors
 SPDX-License-Identifier: Apache-2.0
 -->
-# GhostLock-X200 v1.3.4
+# GhostLock-X200 v1.3.5
 
-![Version](https://img.shields.io/badge/version-v1.3.4-blue.svg)
+![Version](https://img.shields.io/badge/version-v1.3.5-blue.svg)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green.svg)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%2B%20Android-orange.svg)
 ![Kernel](https://img.shields.io/badge/kernel-6.6.89%20b57-lightgrey.svg)
