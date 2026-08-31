@@ -88,6 +88,13 @@ Bootloader、不需要刷机、不会清空数据。运行后获得临时 root�
   修复 enforcing 下 KernelSU 网络/热点异常，并提供一键脚本、动态偏移重建与
   异常重启自动诊断。
 
+## 移动端入口（配套 App）
+
+本仓库为 **PC 版工具链**；如需在**手机端直接一键 root**（通过 [Shizuku]
+(https://github.com/RikkaApps/Shizuku) 授权，无需电脑 adb），请使用配套的
+[ghostlock-x200-app](https://github.com/xiaohj233/ghostlock-x200-app)。两者共用
+同一套提权链与机型模块（PC 版 `devices/<id>` → App 版 `payload/<id>`）。
+
 ## 快速开始
 
 1. 下载 Release 资产 `ghostlock-x200-root-v1.3.4.zip` 并解压（zip 内含
